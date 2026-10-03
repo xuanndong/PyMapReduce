@@ -1,0 +1,29 @@
+[package]
+name = "pymapreduce-core"
+version = "0.1.13"
+edition = "2021"
+description = "Python bindings and distributed runtime for the MapReduce framework"
+license = "MIT"
+exclude = [
+    ".venv/**/*",
+    "tests/**/*",
+    ".pytest_cache/**/*",
+    "test_debug.py",
+    ".gitignore"
+]
+
+[lib]
+name = "_pymapreduce"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.20", features = ["extension-module", "abi3-py38"] }
+pyo3-asyncio = { version = "0.20", features = ["tokio-runtime"] }
+tokio = { version = "1", features = ["full"] }
+mapreduce = { path = "../" }
+async-trait = "0.1"
+dashmap = "5"
+uuid = { version = "1", features = ["v4"] }
+bytes = "1.12.1"
+num_cpus = "1.16"
+libc = "0.2"
