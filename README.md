@@ -1,15 +1,24 @@
 # PyMapReduce
 
-PyMapReduce is a high-performance, asynchronous distributed computing framework built to effortlessly scale Python applications, data processing pipelines, and AI/ML workloads across multi-core machines and distributed clusters. By combining an ultra-fast execution engine written in Rust with Python's native `async`/`await` interface, PyMapReduce delivers high computational throughput without sacrificing developer ergonomics.
+PyMapReduce is a high-performance distributed computing framework designed around the core principles of the **MapReduce programming model** — partitioning complex data workloads into concurrent **Map** (distributed transformation) and **Reduce** (distributed aggregation) operations.
+
+The framework modernizes distributed processing by integrating a lightweight, asynchronous execution engine implemented in **Rust** with an asynchronous **Python** interface. It expands beyond traditional batch execution by offering native `asyncio` task scheduling, long-lived stateful actors, and tiered zero-copy shared memory to support modern data engineering pipelines and AI/ML workloads across multi-core systems and server clusters.
 
 ## Key Features
 
-- **High-Throughput Rust Core**: Built entirely in Rust on top of the Tokio asynchronous runtime, utilizing lock-free data structures and zero-copy binary protocols for ultra-low latency task scheduling and dispatching.
-- **Intuitive Python Async/Await API**: Seamlessly parallelize existing Python code using the simple `@pymapreduce.remote` decorator, fully integrated with standard Python `asyncio`.
-- **Dual Execution Paradigms**: Complete support for both stateless distributed tasks (Map/Filter/Reduce) and stateful distributed actors that maintain their in-memory state across multiple remote method invocations.
-- **Tiered Object Store**: Efficient memory management with an in-memory Hot Tier (RAM) and an automatic LRU Warm Tier (Disk spillover), enabling zero-copy sharing of massive datasets (`ObjectRef`) across workers.
-- **Pluggable Dynamic Schedulers**: Flexible scheduling engine with multiple built-in strategies, including `Adaptive` (work stealing for heterogeneous workloads), `LocalityFirst` (data locality optimization), `LeastLoad`, `WeightedCapacity`, and `RoundRobin`.
-- **Fault Recovery and Resilience**: Continuous heartbeat health monitoring, Write-Ahead Logging (WAL), and automated task re-execution to ensure robust execution even when worker nodes crash.
+- **Rust Execution Engine**: The control plane and network protocol layer are built in Rust on the Tokio asynchronous runtime, delivering high task throughput, low-latency node coordination, and minimal resource utilization.
+- **Asynchronous Python API**: Standard Python functions and classes can be converted into distributed tasks via the `@pymapreduce.remote` decorator, providing native interoperability with the Python `asyncio` event loop without requiring manual thread or process management.
+- **Dual Computation Models**:
+  - *Stateless Tasks*: Pure computational functions executed independently across worker nodes with isolated inputs and outputs.
+  - *Stateful Actors*: Long-lived class instances maintained in worker memory across multiple remote method invocations, avoiding repetitive state reloading for models, cache stores, or connection pools.
+- **Tiered Object Store**: Large intermediate results (such as Pandas DataFrames or NumPy arrays) are held in shared memory (RAM Hot Tier) and automatically spilled to disk via memory mapping (Warm Tier) when capacity thresholds are reached. Downstream tasks retrieve data by reference (`ObjectRef`) via peer-to-peer transfers, preventing coordinator bottlenecks.
+- **Pluggable Scheduling Algorithms**: Configurable scheduling strategies tailored to diverse cluster environments:
+  - `Adaptive`: Balances cluster workload dynamically with work-stealing for uneven tasks.
+  - `LeastLoad`: Routes tasks to the worker with the lowest active task count.
+  - `LocalityFirst`: Prioritizes workers already holding required input data in memory.
+  - `WeightedCapacity`: Allocates tasks proportionally based on node hardware capacity (CPU/RAM).
+  - `RoundRobin`: Cyclic task distribution across available nodes.
+- **Fault Recovery and State Persistence**: Periodic heartbeat monitoring continuously validates worker node health, automatically re-dispatching unfinished tasks upon node failure. Cluster state changes are journaled via a Write-Ahead Log (WAL) to ensure reliable state recovery.
 
 ## Installation
 
