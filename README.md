@@ -61,7 +61,7 @@ if __name__ == "__main__":
 
 For distributed execution across multiple machines, use the `mapreduce` CLI:
 
-### Start Head Node
+#### Start Head Node
 
 The Head Node manages the global cluster state, task dispatching, and worker health monitoring:
 
@@ -73,7 +73,7 @@ Options:
 - `--port <PORT>`: Port for Head Node service (default: `7777`).
 - `--scheduler <STRATEGY>`: Scheduling algorithm (`RoundRobin`, `WeightedCapacity`, `LeastLoad`, `LocalityFirst`, `Adaptive`). Default: `RoundRobin`.
 
-### Start Worker Node
+#### Start Worker Node
 
 Worker Nodes connect to the Head Node and execute assigned computational tasks:
 
@@ -90,19 +90,19 @@ Options:
 
 A multi-container setup is available via `docker-compose.yml` to run the Head Node and Worker Nodes in isolated environments:
 
-### Start Services
+#### Start Services
 
 ```bash
 docker compose up
 ```
 
-### Scale Worker Containers
+#### Scale Worker Containers
 
 ```bash
 docker compose up --scale workernode=3
 ```
 
-### Environment Configuration
+#### Environment Configuration
 
 Configure cluster parameters via environment variables:
 
