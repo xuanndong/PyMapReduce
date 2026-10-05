@@ -317,6 +317,21 @@ impl Driver {
         Ok(())
     }
 
+    fn cancel_job<'py>(&self, py: Python<'py>, job_id: String) -> PyResult<&'py PyAny> {
+        let inner = self.inner.clone();
+        
+        pyo3_asyncio::tokio::future_into_py(py, async move {
+            let uuid = uuid::Uuid::parse_str(&job_id)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+                
+            inner.cancel_job(uuid)
+                .await
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+                
+            Ok(())
+        })
+    }
+
     fn get_job_status<'py>(&self, py: Python<'py>, job_id: String) -> PyResult<&'py PyAny> {
         let inner = self.inner.clone();
         pyo3_asyncio::tokio::future_into_py(py, async move {
@@ -384,21 +399,26 @@ struct WorkerState {
 pub struct PythonExecutor {
     workers: Arc<DashMap<usize, Arc<WorkerState>>>,
     actor_to_worker: Arc<DashMap<uuid::Uuid, usize>>,
+    actor_metadata: Arc<DashMap<uuid::Uuid, Vec<u8>>>,
+    running_task_worker: Arc<DashMap<uuid::Uuid, usize>>,
     max_cpus: usize,
     next_worker_id: AtomicUsize,
 }
 
 impl PythonExecutor {
-    pub fn new(max_cpus: usize, idle_timeout_mins: u32) -> Self {
+    pub fn new(max_cpus: usize, idle_timeout_secs: u64) -> Self {
         let workers: Arc<DashMap<usize, Arc<WorkerState>>> = Arc::new(DashMap::new());
         let actor_to_worker = Arc::new(DashMap::new());
+        let actor_metadata = Arc::new(DashMap::new());
+        let running_task_worker = Arc::new(DashMap::new());
         
-        if idle_timeout_mins > 0 {
+        if idle_timeout_secs > 0 {
             let workers_clone = workers.clone();
             tokio::spawn(async move {
-                let timeout = std::time::Duration::from_secs((idle_timeout_mins as u64) * 60);
+                let timeout = std::time::Duration::from_secs(idle_timeout_secs);
+                let check_interval = std::time::Duration::from_secs(idle_timeout_secs.min(10).max(1));
                 loop {
-                    sleep(std::time::Duration::from_secs(60)).await;
+                    sleep(check_interval).await;
                     let now = Instant::now();
                     let mut to_remove = Vec::new();
                     
@@ -422,6 +442,8 @@ impl PythonExecutor {
         Self {
             workers,
             actor_to_worker,
+            actor_metadata,
+            running_task_worker,
             max_cpus,
             next_worker_id: AtomicUsize::new(0),
         }
@@ -444,42 +466,61 @@ impl Executor for PythonExecutor {
             }
         }
         
+        let mut needs_actor_init = false;
         let worker_state = match &task.kind {
             mapreduce::types::task::TaskKind::ActorTask { actor_id, .. } => {
-                if let Some(w_id) = self.actor_to_worker.get(actor_id) {
-                    if let Some(w) = self.workers.get(&w_id) {
-                        w.clone()
-                    } else {
-                        let w = self.get_or_spawn_worker(env_id).await?;
-                        self.actor_to_worker.insert(*actor_id, w.id);
-                        w
-                    }
+                let existing = self
+                    .actor_to_worker
+                    .get(actor_id)
+                    .and_then(|w_id| self.workers.get(&w_id).map(|w| w.clone()));
+
+                if let Some(w) = existing {
+                    w
                 } else {
                     let w = self.get_or_spawn_worker(env_id).await?;
                     self.actor_to_worker.insert(*actor_id, w.id);
+                    needs_actor_init = self.actor_metadata.contains_key(actor_id);
                     w
                 }
-            },
+            }
             mapreduce::types::task::TaskKind::ActorDestruction { actor_id } => {
-                if let Some(w_id) = self.actor_to_worker.get(actor_id) {
-                    if let Some(w) = self.workers.get(&w_id) {
-                        w.clone()
-                    } else {
-                        self.get_or_spawn_worker(env_id).await?
-                    }
+                if let Some(w) = self.actor_to_worker.get(actor_id).and_then(|w_id| self.workers.get(&w_id).map(|w| w.clone())) {
+                    w
                 } else {
                     self.get_or_spawn_worker(env_id).await?
                 }
-            },
-            _ => {
-                self.get_or_spawn_worker(env_id).await?
             }
+            _ => self.get_or_spawn_worker(env_id).await?,
         };
+
+        let task_id = task.id;
+        self.running_task_worker.insert(task_id, worker_state.id);
         
         let result_bytes = {
             let mut worker_lock = worker_state.worker.lock().await;
             *worker_state.last_used.lock().await = Instant::now();
             
+            if needs_actor_init {
+                if let mapreduce::types::task::TaskKind::ActorTask { actor_id, .. } = &task.kind {
+                    if let Some(meta_payload) = self.actor_metadata.get(actor_id) {
+                        let init_envelope = Python::with_gil(|py| -> Result<Vec<u8>, ExecutorError> {
+                            let pickle = py.import("cloudpickle").or_else(|_| py.import("pickle"))
+                                .map_err(|e| ExecutorError::Failed(e.to_string()))?;
+                            let dict = pyo3::types::PyDict::new(py);
+                            dict.set_item("kind", "ActorCreation").unwrap();
+                            dict.set_item("actor_id", actor_id.to_string()).unwrap();
+                            let py_payload = pyo3::types::PyBytes::new(py, meta_payload.value());
+                            dict.set_item("payload", py_payload).unwrap();
+                            dict.set_item("deps", pyo3::types::PyDict::new(py)).unwrap();
+                            dict.set_item("dep_shm", pyo3::types::PyDict::new(py)).unwrap();
+                            let dumps = pickle.call_method1("dumps", (dict,)).map_err(|e| ExecutorError::Failed(e.to_string()))?;
+                            dumps.extract().map_err(|e| ExecutorError::Failed(e.to_string()))
+                        })?;
+                        let _ = worker_lock.send_and_receive(init_envelope).await;
+                    }
+                }
+            }
+
             let envelope_bytes = Python::with_gil(|py| -> Result<Vec<u8>, ExecutorError> {
                 let pickle = py.import("cloudpickle").or_else(|_| py.import("pickle"))
                     .map_err(|e| ExecutorError::Failed(e.to_string()))?;
@@ -507,7 +548,6 @@ impl Executor for PythonExecutor {
                 let py_payload = pyo3::types::PyBytes::new(py, &task.payload);
                 dict.set_item("payload", py_payload).unwrap();
                 
-                // Pass fallback bytes
                 let py_deps = pyo3::types::PyDict::new(py);
                 for (k, v) in &resolved_deps {
                     let v_bytes = pyo3::types::PyBytes::new(py, v);
@@ -515,7 +555,6 @@ impl Executor for PythonExecutor {
                 }
                 dict.set_item("deps", py_deps).unwrap();
 
-                // Pass shared memory paths for zero-copy loading
                 let py_dep_shm = pyo3::types::PyDict::new(py);
                 for (k, v) in &dep_shm_paths {
                     py_dep_shm.set_item(k, v).unwrap();
@@ -527,12 +566,16 @@ impl Executor for PythonExecutor {
             })?;
             
             match worker_lock.send_and_receive(envelope_bytes).await {
-                Ok(res) => res,
+                Ok(res) => {
+                    self.running_task_worker.remove(&task_id);
+                    res
+                },
                 Err(crate::ipc::IpcError::AppError(e)) => {
+                    self.running_task_worker.remove(&task_id);
                     return Err(ExecutorError::Failed(format!("App Error: {}", e)));
                 }
                 Err(crate::ipc::IpcError::IoError(e)) => {
-                    // BROKEN PIPE! Evict this worker!
+                    self.running_task_worker.remove(&task_id);
                     self.workers.remove(&worker_state.id);
                     return Err(ExecutorError::Failed(format!("IPC Crash (OOM or Segfault): {}", e)));
                 }
@@ -541,8 +584,10 @@ impl Executor for PythonExecutor {
         
         if let mapreduce::types::task::TaskKind::ActorCreation { actor_id, .. } = &task.kind {
             self.actor_to_worker.insert(*actor_id, worker_state.id);
+            self.actor_metadata.insert(*actor_id, task.payload.clone());
         } else if let mapreduce::types::task::TaskKind::ActorDestruction { actor_id } = &task.kind {
             self.actor_to_worker.remove(actor_id);
+            self.actor_metadata.remove(actor_id);
         }
         
         let object_id = uuid::Uuid::new_v4();
@@ -560,6 +605,29 @@ impl Executor for PythonExecutor {
         })?;
         
         Ok((serialized_ref, Some(object_id)))
+    }
+
+    async fn cancel(&self, task_id: uuid::Uuid) {
+        if let Some((_, worker_id)) = self.running_task_worker.remove(&task_id) {
+            if let Some((_, state)) = self.workers.remove(&worker_id) {
+                let mut worker_lock = state.worker.lock().await;
+                #[cfg(unix)]
+                {
+                    let _ = worker_lock.kill_group(libc::SIGTERM);
+                    let wait_res = tokio::time::timeout(
+                        std::time::Duration::from_secs(3),
+                        worker_lock.child.wait()
+                    ).await;
+                    if wait_res.is_err() {
+                        let _ = worker_lock.kill_group(libc::SIGKILL);
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = worker_lock.child.kill().await;
+                }
+            }
+        }
     }
 }
 
@@ -620,7 +688,7 @@ impl PythonExecutor {
 
 #[pyfunction]
 #[pyo3(signature = (head_addr, workers=None, idle_timeout=0))]
-fn start_worker<'py>(py: Python<'py>, head_addr: String, workers: Option<usize>, idle_timeout: u32) -> PyResult<&'py PyAny> {
+fn start_worker<'py>(py: Python<'py>, head_addr: String, workers: Option<usize>, idle_timeout: u64) -> PyResult<&'py PyAny> {
     pyo3_asyncio::tokio::future_into_py(py, async move {
         use mapreduce::cluster::worker::WorkerNode;
         use mapreduce::types::node::NodeCapacity;
@@ -654,7 +722,7 @@ fn start_worker<'py>(py: Python<'py>, head_addr: String, workers: Option<usize>,
 
 #[pyfunction]
 #[pyo3(signature = (head_addr, cpus=None, idle_timeout=0))]
-fn connect_worker<'py>(py: Python<'py>, head_addr: String, cpus: Option<usize>, idle_timeout: u32) -> PyResult<&'py PyAny> {
+fn connect_worker<'py>(py: Python<'py>, head_addr: String, cpus: Option<usize>, idle_timeout: u64) -> PyResult<&'py PyAny> {
     pyo3_asyncio::tokio::future_into_py(py, async move {
         use mapreduce::cluster::worker::WorkerNode;
         use mapreduce::types::node::NodeCapacity;

@@ -10,4 +10,7 @@ pub trait Executor: Send + Sync + 'static {
         task: &Task,
         store: Arc<crate::object_store::store::ObjectStore>,
     ) -> Result<(Vec<u8>, Option<uuid::Uuid>), ExecutorError>;
+
+    async fn cancel(&self, _task_id: uuid::Uuid) {}
 }
+

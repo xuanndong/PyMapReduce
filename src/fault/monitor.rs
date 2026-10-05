@@ -1,18 +1,21 @@
+use crate::gcs::state::{ActorStatus, GcsState, TaskRecord};
 use crate::gcs::store::Gcs;
+use crate::protocol::message::Message;
 use crate::scheduler::dispatcher::Dispatcher;
+use crate::types::job::{JobId, JobStatus};
 use crate::types::node::WorkerId;
-use std::collections::HashMap;
+use crate::types::task::{Task, TaskKind, TaskStatus};
+use dashmap::DashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-
-use crate::types::job::JobId;
-use crate::protocol::message::Message;
-use dashmap::DashMap;
 use tokio::sync::mpsc::Sender;
+use uuid::Uuid;
 
 const HEARTBEAT_TIMEOUT_SECS: u64 = 30;
 const MAX_SNOOZE_COUNT: u32 = 1;
 
+/// HealthMonitor tracks worker node heartbeats and handles failure recovery.
 pub struct HealthMonitor {
     gcs: Arc<Gcs>,
     dispatcher: Arc<Dispatcher>,
@@ -38,120 +41,11 @@ impl HealthMonitor {
 
     pub fn record_heartbeat(&mut self, worker_id: WorkerId) {
         self.last_heartbeat.insert(worker_id, Instant::now());
-        self.snooze_counts.insert(worker_id, 0); // Reset snooze count
+        self.snooze_counts.insert(worker_id, 0);
     }
 
-    pub async fn remove_dead_worker(&mut self, worker_id: WorkerId) {
-        self.last_heartbeat.remove(&worker_id);
-        self.snooze_counts.remove(&worker_id);
-
-        let mut tasks_to_requeue = Vec::new();
-        let mut actor_tasks_to_fail = Vec::new();
-
-        // Single write lock scope: remove node, collect tasks, mark dead actors, drain mailboxes
-        {
-            let mut state = self.gcs.write();
-            state.nodes.remove(&worker_id);
-            state.worker_load.remove(&worker_id);
-
-            // Re-queue pending and running tasks that were on the dead worker
-            for task_record in state.active_tasks.values_mut() {
-                if task_record.assigned_to == Some(worker_id)
-                    && (task_record.status == crate::types::task::TaskStatus::Running
-                        || task_record.status == crate::types::task::TaskStatus::Pending)
-                {
-                    task_record.assigned_to = None;
-                    task_record.status = crate::types::task::TaskStatus::Pending;
-                    tasks_to_requeue.push(task_record.task.clone());
-                }
-            }
-
-            // Lineage Recomputation: Detect lost intermediate objects and recompute producer tasks
-            let mut lost_objects = Vec::new();
-            for (oid, loc) in state.object_catalog.iter_mut() {
-                loc.nodes.remove(&worker_id);
-                if loc.nodes.is_empty() {
-                    lost_objects.push(*oid);
-                }
-            }
-            for oid in &lost_objects {
-                state.object_catalog.remove(oid);
-            }
-
-            if !lost_objects.is_empty() {
-                for task_record in state.active_tasks.values_mut() {
-                    if let Some(oid) = task_record.output_object_id {
-                        if lost_objects.contains(&oid) && task_record.status == crate::types::task::TaskStatus::Completed {
-                            task_record.assigned_to = None;
-                            task_record.status = crate::types::task::TaskStatus::Pending;
-                            tasks_to_requeue.push(task_record.task.clone());
-                        }
-                    }
-                }
-            }
-            
-            // Handle actors hosted on this crashed worker
-            let has_other_workers = !state.nodes.is_empty();
-            let mut dead_actors = Vec::new();
-            for actor_record in state.actors.values_mut() {
-                if actor_record.worker_id == Some(worker_id) {
-                    if has_other_workers {
-                        actor_record.status = crate::gcs::state::ActorStatus::Creating;
-                        actor_record.worker_id = None;
-                        let recreation_task = crate::types::task::Task {
-                            id: uuid::Uuid::new_v4(),
-                            job_id: uuid::Uuid::nil(),
-                            kind: crate::types::task::TaskKind::ActorCreation {
-                                actor_id: actor_record.actor_id,
-                                class_name: actor_record.class_name.clone(),
-                            },
-                            payload: actor_record.creation_payload.clone(),
-                            runtime_env: None,
-                            dependencies: Vec::new(),
-                        };
-                        tasks_to_requeue.push(recreation_task);
-                    } else {
-                        actor_record.status = crate::gcs::state::ActorStatus::Dead("Worker crashed".to_string());
-                        dead_actors.push(actor_record.actor_id);
-                    }
-                }
-            }
-
-            // Drain mailboxes only for permanently dead actors
-            for actor_id in dead_actors {
-                let stuck_tasks = self.dispatcher.drain_actor_mailbox(&actor_id);
-                actor_tasks_to_fail.extend(stuck_tasks);
-            }
-        }
-        // Write lock is dropped here
-
-        // Send failure message for stuck actor tasks to driver (no GCS lock held)
-        for task in &actor_tasks_to_fail {
-            if let Some(driver_tx) = self.driver_connections.get(&task.job_id) {
-                let _ = driver_tx.value().send(Message::TaskFailure {
-                    task_id: task.id,
-                    job_id: task.job_id,
-                    error: "Actor Dead (Worker crashed)".to_string(),
-                }).await;
-            }
-        }
-
-        // Second write lock scope: mark actor tasks as failed in GCS
-        if !actor_tasks_to_fail.is_empty() {
-            let mut state = self.gcs.write();
-            for task in actor_tasks_to_fail {
-                if let Some(record) = state.active_tasks.get_mut(&task.id) {
-                    record.status = crate::types::task::TaskStatus::Failed("Actor Dead (Worker crashed)".to_string());
-                }
-            }
-        }
-
-        for task in tasks_to_requeue {
-            self.dispatcher.requeue_priority(task);
-        }
-    }
-
-    pub async fn scan_and_recover(&mut self) {
+    /// Identifies and returns worker IDs whose heartbeat has timed out beyond snooze threshold.
+    fn detect_dead_workers(&mut self) -> Vec<WorkerId> {
         let now = Instant::now();
         let timeout = Duration::from_secs(HEARTBEAT_TIMEOUT_SECS);
         let mut dead_workers = Vec::new();
@@ -167,6 +61,182 @@ impl HealthMonitor {
             }
         }
 
+        dead_workers
+    }
+
+    /// Resets running/pending tasks assigned to the dead worker so they can be rescheduled.
+    fn recover_assigned_tasks(
+        state: &mut GcsState,
+        worker_id: WorkerId,
+        dead_jobs: &HashSet<JobId>,
+    ) -> Vec<Task> {
+        state
+            .active_tasks
+            .values_mut()
+            .filter(|rec| {
+                rec.assigned_to == Some(worker_id)
+                    && matches!(rec.status, TaskStatus::Running | TaskStatus::Pending)
+                    && !dead_jobs.contains(&rec.task.job_id)
+            })
+            .map(|rec| {
+                rec.assigned_to = None;
+                rec.status = TaskStatus::Pending;
+                rec.task.clone()
+            })
+            .collect()
+    }
+
+    /// Evicts objects lost when the worker died and requeues completed tasks for lineage recomputation.
+    fn recover_lost_lineage(
+        state: &mut GcsState,
+        worker_id: WorkerId,
+        dead_jobs: &HashSet<JobId>,
+    ) -> Vec<Task> {
+        let mut lost_objects = HashSet::new();
+        state.object_catalog.retain(|oid, loc| {
+            loc.nodes.remove(&worker_id);
+            if loc.nodes.is_empty() {
+                lost_objects.insert(*oid);
+                false
+            } else {
+                true
+            }
+        });
+
+        if lost_objects.is_empty() {
+            return Vec::new();
+        }
+
+        state
+            .active_tasks
+            .values_mut()
+            .filter(|rec| {
+                rec.status == TaskStatus::Completed
+                    && !dead_jobs.contains(&rec.task.job_id)
+                    && rec.output_object_id.is_some_and(|oid| lost_objects.contains(&oid))
+            })
+            .map(|rec| {
+                rec.assigned_to = None;
+                rec.status = TaskStatus::Pending;
+                rec.task.clone()
+            })
+            .collect()
+    }
+
+    /// Recovers actors assigned to the dead worker, either scheduling recreation or marking them Dead.
+    fn recover_actors(
+        state: &mut GcsState,
+        worker_id: WorkerId,
+        dispatcher: &Dispatcher,
+    ) -> (Vec<Task>, Vec<Task>) {
+        let has_other_workers = !state.nodes.is_empty();
+        let mut dead_actors = Vec::new();
+        let mut recreation_tasks = Vec::new();
+
+        for actor_record in state.actors.values_mut() {
+            if actor_record.worker_id == Some(worker_id) {
+                if has_other_workers {
+                    actor_record.status = ActorStatus::Creating;
+                    actor_record.worker_id = None;
+                    let recreation_task = Task {
+                        id: Uuid::new_v4(),
+                        job_id: Uuid::nil(),
+                        kind: TaskKind::ActorCreation {
+                            actor_id: actor_record.actor_id,
+                            class_name: actor_record.class_name.clone(),
+                        },
+                        payload: actor_record.creation_payload.clone(),
+                        runtime_env: None,
+                        dependencies: Vec::new(),
+                    };
+                    recreation_tasks.push(recreation_task);
+                } else {
+                    actor_record.status = ActorStatus::Dead("Worker crashed".to_string());
+                    dead_actors.push(actor_record.actor_id);
+                }
+            }
+        }
+
+        for recreation_task in &recreation_tasks {
+            state.active_tasks.insert(
+                recreation_task.id,
+                TaskRecord {
+                    task: recreation_task.clone(),
+                    status: TaskStatus::Pending,
+                    assigned_to: None,
+                    retry_count: 0,
+                    output_object_id: None,
+                },
+            );
+        }
+
+        let mut actor_tasks_to_fail = Vec::new();
+        for actor_id in dead_actors {
+            let stuck_tasks = dispatcher.drain_actor_mailbox(&actor_id);
+            for task in &stuck_tasks {
+                if let Some(record) = state.active_tasks.get_mut(&task.id) {
+                    record.status = TaskStatus::Failed("Actor Dead (Worker crashed)".to_string());
+                }
+            }
+            actor_tasks_to_fail.extend(stuck_tasks);
+        }
+
+        (recreation_tasks, actor_tasks_to_fail)
+    }
+
+    /// Notifies driver connections for actor tasks that cannot be recovered.
+    async fn notify_failed_actor_tasks(&self, failed_tasks: &[Task]) {
+        for task in failed_tasks {
+            if let Some(driver_tx) = self.driver_connections.get(&task.job_id) {
+                let _ = driver_tx
+                    .value()
+                    .send(Message::TaskFailure {
+                        task_id: task.id,
+                        job_id: task.job_id,
+                        error: "Actor Dead (Worker crashed)".to_string(),
+                    })
+                    .await;
+            }
+        }
+    }
+
+    /// Unregisters a dead worker and triggers recovery for tasks, objects, and actors.
+    pub async fn remove_dead_worker(&mut self, worker_id: WorkerId) {
+        self.last_heartbeat.remove(&worker_id);
+        self.snooze_counts.remove(&worker_id);
+
+        let (tasks_to_requeue, actor_tasks_to_fail) = {
+            let mut state = self.gcs.write();
+            state.nodes.remove(&worker_id);
+            state.worker_load.remove(&worker_id);
+
+            let dead_jobs: HashSet<JobId> = state
+                .jobs
+                .iter()
+                .filter(|(_, j)| j.status != JobStatus::Running)
+                .map(|(id, _)| *id)
+                .collect();
+
+            let mut requeue = Self::recover_assigned_tasks(&mut state, worker_id, &dead_jobs);
+            requeue.extend(Self::recover_lost_lineage(&mut state, worker_id, &dead_jobs));
+
+            let (recreation_tasks, failed_actor_tasks) =
+                Self::recover_actors(&mut state, worker_id, &self.dispatcher);
+            requeue.extend(recreation_tasks);
+
+            (requeue, failed_actor_tasks)
+        };
+
+        self.notify_failed_actor_tasks(&actor_tasks_to_fail).await;
+
+        for task in tasks_to_requeue {
+            self.dispatcher.requeue_priority(task);
+        }
+    }
+
+    /// Scans worker heartbeats and initiates recovery for any unresponsive workers.
+    pub async fn scan_and_recover(&mut self) {
+        let dead_workers = self.detect_dead_workers();
         for worker_id in dead_workers {
             self.remove_dead_worker(worker_id).await;
         }
@@ -244,7 +314,7 @@ mod tests {
                 },
                 addr: "".to_string(),
             },
-            &*state,
+            &state,
         );
 
         assert_eq!(dispatched.unwrap().id, task.id);

@@ -1,6 +1,6 @@
 [package]
 name = "mapreduce"
-version = "0.1.13"
+version = "0.1.14"
 edition = "2021"
 description = "High-performance distributed MapReduce engine in Rust"
 license = "MIT"

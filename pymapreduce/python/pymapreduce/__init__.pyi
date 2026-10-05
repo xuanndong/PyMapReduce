@@ -79,6 +79,12 @@ class Driver:
         """
         pass
 
+    def cancel_job(self, job_id: str) -> Coroutine[Any, Any, None]:
+        """
+        Explicitly cancels a job across the cluster, terminating running tasks and freeing worker resources.
+        """
+        pass
+
     def get_job_status(self, job_id: str) -> Coroutine[Any, Any, Optional[tuple[int, int]]]:
         """
         Queries the current progress (completed_tasks, total_tasks) of a job.
@@ -98,7 +104,7 @@ def start_worker(head_addr: str, workers: Optional[int] = None, idle_timeout: in
     """
     Connects to an existing HeadNode and starts accepting tasks.
     By default, uses all available CPU cores.
-    If idle_timeout > 0, kills idle python processes after that many minutes.
+    If idle_timeout > 0, kills idle python processes after that many seconds.
     """
     pass
 

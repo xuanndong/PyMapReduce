@@ -30,6 +30,10 @@ impl Dispatcher {
         self.queue.lock().drain_actor_mailbox(actor_id)
     }
 
+    pub fn cancel_job(&self, job_id: uuid::Uuid) -> Vec<uuid::Uuid> {
+        self.queue.lock().cancel_job_tasks(job_id)
+    }
+
     pub fn dispatch(&self, worker: &WorkerInfo, gcs: &GcsState) -> Option<Task> {
         let mut q = self.queue.lock();
         self.strategy.poll_next_task(&mut q, worker, gcs)

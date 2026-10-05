@@ -1,6 +1,6 @@
 [package]
 name = "pymapreduce-core"
-version = "0.1.13"
+version = "0.1.14"
 edition = "2021"
 description = "Python bindings and distributed runtime for the MapReduce framework"
 license = "MIT"

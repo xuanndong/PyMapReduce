@@ -3,7 +3,7 @@ use crate::types::job::{Job, JobId, JobStatus};
 use crate::types::node::{NodeInfo, WorkerId};
 use crate::types::task::{Task, TaskId, TaskStatus};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JobRecord {
@@ -58,6 +58,8 @@ pub struct GcsState {
     pub object_catalog: HashMap<ObjectId, ObjectLocation>,
     pub object_subscribers: HashMap<ObjectId, HashSet<WorkerId>>,
     pub actors: HashMap<crate::types::task::ActorId, ActorRecord>,
+    #[serde(default)]
+    pub finished_jobs_queue: VecDeque<(JobId, u64)>,
 }
 
 impl Default for GcsState {
@@ -67,6 +69,9 @@ impl Default for GcsState {
 }
 
 impl GcsState {
+    pub const DEFAULT_MAX_FINISHED_JOBS: usize = 2000;
+    pub const DEFAULT_JOB_TTL_SECS: u64 = 3600;
+
     pub fn new() -> Self {
         Self {
             jobs: HashMap::new(),
@@ -77,6 +82,123 @@ impl GcsState {
             object_catalog: HashMap::new(),
             object_subscribers: HashMap::new(),
             actors: HashMap::new(),
+            finished_jobs_queue: VecDeque::new(),
         }
+    }
+
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
+    fn remove_job_if_not_running(&mut self, job_id: &JobId) {
+        if self.jobs.get(job_id).is_some_and(|r| r.status != JobStatus::Running) {
+            self.jobs.remove(job_id);
+        }
+    }
+
+    pub fn mark_job_finished(&mut self, job_id: JobId) {
+        self.finished_jobs_queue.push_back((job_id, Self::now_secs()));
+        self.enforce_job_retention(Self::DEFAULT_MAX_FINISHED_JOBS, Self::DEFAULT_JOB_TTL_SECS);
+    }
+
+    pub fn enforce_job_retention(&mut self, max_finished_jobs: usize, ttl_secs: u64) {
+        let now = Self::now_secs();
+
+        while let Some(&(_, finish_time)) = self.finished_jobs_queue.front() {
+            if now.saturating_sub(finish_time) >= ttl_secs {
+                if let Some((job_id, _)) = self.finished_jobs_queue.pop_front() {
+                    self.remove_job_if_not_running(&job_id);
+                }
+            } else {
+                break;
+            }
+        }
+
+        while self.finished_jobs_queue.len() > max_finished_jobs {
+            if let Some((job_id, _)) = self.finished_jobs_queue.pop_front() {
+                self.remove_job_if_not_running(&job_id);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    #[test]
+    fn test_job_retention_capacity_cap() {
+        let mut state = GcsState::new();
+
+        let mut job_ids = Vec::new();
+        for _ in 0..5 {
+            let jid = Uuid::new_v4();
+            job_ids.push(jid);
+            state.jobs.insert(
+                jid,
+                JobRecord {
+                    job: Job { id: jid, name: "test".to_string() },
+                    status: JobStatus::Completed,
+                    tasks: vec![],
+                    results: HashMap::new(),
+                },
+            );
+            state.mark_job_finished(jid);
+        }
+
+        assert_eq!(state.jobs.len(), 5);
+        assert_eq!(state.finished_jobs_queue.len(), 5);
+
+        state.enforce_job_retention(3, 3600);
+
+        assert_eq!(state.jobs.len(), 3);
+        assert_eq!(state.finished_jobs_queue.len(), 3);
+        assert!(!state.jobs.contains_key(&job_ids[0]));
+        assert!(!state.jobs.contains_key(&job_ids[1]));
+        assert!(state.jobs.contains_key(&job_ids[2]));
+        assert!(state.jobs.contains_key(&job_ids[3]));
+        assert!(state.jobs.contains_key(&job_ids[4]));
+    }
+
+    #[test]
+    fn test_job_retention_ttl() {
+        let mut state = GcsState::new();
+        let jid1 = Uuid::new_v4();
+        let jid2 = Uuid::new_v4();
+
+        state.jobs.insert(
+            jid1,
+            JobRecord {
+                job: Job { id: jid1, name: "test1".to_string() },
+                status: JobStatus::Completed,
+                tasks: vec![],
+                results: HashMap::new(),
+            },
+        );
+        state.jobs.insert(
+            jid2,
+            JobRecord {
+                job: Job { id: jid2, name: "test2".to_string() },
+                status: JobStatus::Completed,
+                tasks: vec![],
+                results: HashMap::new(),
+            },
+        );
+
+        let now = GcsState::now_secs();
+
+        // jid1 finished 5000 seconds ago, jid2 finished just now
+        state.finished_jobs_queue.push_back((jid1, now - 5000));
+        state.finished_jobs_queue.push_back((jid2, now));
+
+        state.enforce_job_retention(2000, 3600);
+
+        assert_eq!(state.jobs.len(), 1);
+        assert!(!state.jobs.contains_key(&jid1));
+        assert!(state.jobs.contains_key(&jid2));
     }
 }

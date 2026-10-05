@@ -148,7 +148,7 @@ impl SchedulingStrategy for LeastLoadStrategy {
         let mut my_load = 0;
         let mut min_load = usize::MAX;
         
-        for (w_id, _) in &gcs.nodes {
+        for w_id in gcs.nodes.keys() {
             let load = gcs.worker_load.get(w_id).copied().unwrap_or(0);
             if load < min_load {
                 min_load = load;

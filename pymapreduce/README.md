@@ -2,7 +2,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/version-0.1.13-blue.svg?style=flat-square)](https://pypi.org/project/pymapreduce-core/)
+[![Version](https://img.shields.io/badge/version-0.1.14-blue.svg?style=flat-square)](https://pypi.org/project/pymapreduce-core/)
 [![Python](https://img.shields.io/badge/python-3.8%2B-brightgreen.svg?style=flat-square)](https://www.python.org/)
 [![Rust](https://img.shields.io/badge/powered%20by-Rust%201.75%2B-orange.svg?style=flat-square)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg?style=flat-square)](LICENSE)
@@ -37,21 +37,23 @@ class Counter:
         return self.value
 
 async def main():
-    # Start local cluster
-    driver = await pymapreduce.init()
-    await pymapreduce.connect_worker("127.0.0.1:7777", cpus=4)
+    # Start local cluster coordinator (HeadNode) and connect a local worker
+    driver = await pymapreduce.init("127.0.0.1:7777")
+    worker = await pymapreduce.connect_worker("127.0.0.1:7777", cpus=4)
 
-    # Run tasks in parallel
-    futures = [square.remote(i) for i in range(5)]
-    results = await asyncio.gather(*futures)
+    # Run tasks in parallel and fetch lazy object references
+    refs = [await square.remote(i) for i in range(5)]
+    results = await asyncio.gather(*[ref.get() for ref in refs])
     print("Parallel Squares:", results)  # [0, 1, 4, 9, 16]
 
-    # Instantiate and call actor
+    # Instantiate stateful actor on the cluster
     counter = await Counter.remote(start=10)
-    print("Counter:", await counter.increment.remote(5))  # 15
+    res_ref = await counter.increment.remote(5)
+    print("Counter Value:", await res_ref.get())  # 15
 
-    # Clean up actor
+    # Clean up actor and worker
     await pymapreduce.kill(counter)
+    await worker.disconnect(graceful=True)
 
 if __name__ == "__main__":
     asyncio.run(main())
@@ -70,20 +72,21 @@ if __name__ == "__main__":
   - [2. User Guide](#2-user-guide)
     - [2.1. Distributed Tasks (Functions)](#21-distributed-tasks-functions)
     - [2.2. Distributed Actors (Stateful Classes)](#22-distributed-actors-stateful-classes)
-    - [2.3. Actor Memory Self-Protection](#23-actor-memory-self-protection)
+    - [2.3. Actor Memory Management & Lifecycle](#23-actor-memory-management--lifecycle)
     - [2.4. Automatic Code Shipping (`runtime_env`)](#24-automatic-code-shipping-runtime_env)
     - [2.5. Zero-Copy Shared Memory (`ObjectRef`)](#25-zero-copy-shared-memory-objectref)
     - [2.6. Distributed Datasets](#26-distributed-datasets)
-    - [2.7. Job Execution Timeouts](#27-job-execution-timeouts)
+    - [2.7. Job Timeouts & Task Cancellation](#27-job-timeouts--task-cancellation)
   - [3. Cluster Deployment](#3-cluster-deployment)
     - [3.1. Local Mode (Embedded)](#31-local-mode-embedded)
     - [3.2. Multi-Server Production Cluster](#32-multi-server-production-cluster)
+    - [3.3. Docker & Kubernetes Deployment](#33-docker--kubernetes-deployment)
   - [4. Task Scheduling Strategies](#4-task-scheduling-strategies)
   - [5. Command Line Interface (CLI)](#5-command-line-interface-cli)
   - [6. Python API Reference](#6-python-api-reference)
     - [Top-Level Functions](#top-level-functions)
-    - [Core Classes \& Methods](#core-classes--methods)
-  - [7. Configuration \& Environment Variables](#7-configuration--environment-variables)
+    - [Core Classes & Methods](#core-classes--methods)
+  - [7. Configuration & Environment Variables](#7-configuration--environment-variables)
   - [8. License](#8-license)
 
 ---
@@ -130,12 +133,12 @@ async def main():
     await pymapreduce.connect_worker("127.0.0.1:7777", cpus=4)
 
     # 1. Single execution
-    res = await process_item.remote(10, 2.5)
-    print("Single Result:", res)
+    res_ref = await process_item.remote(10, 2.5)
+    print("Single Result:", await res_ref.get())
 
     # 2. Parallel execution
-    futures = [process_item.remote(i, 2.5) for i in range(10)]
-    results = await asyncio.gather(*futures)
+    refs = [await process_item.remote(i, 2.5) for i in range(10)]
+    results = await asyncio.gather(*[ref.get() for ref in refs])
     print("Parallel Results:", results)
 
 if __name__ == "__main__":
@@ -146,7 +149,7 @@ if __name__ == "__main__":
 
 ### 2.2. Distributed Actors (Stateful Classes)
 
-Decorate a Python class with `@pymapreduce.remote` to create a **Stateful Actor**. The instance stays loaded in worker memory, preserving state across method calls:
+Decorate a Python class with `@pymapreduce.remote` to create a **Stateful Actor**. The instance stays resident in worker memory, preserving state across successive RPC invocations:
 
 ```python
 import asyncio
@@ -174,9 +177,9 @@ async def main():
     model = await MLModelServer.remote(model_name="ResNet50")
 
     # 2. Call methods sequentially in FIFO order
-    p1 = await model.predict.remote([1.0, 2.0, 3.0])
-    p2 = await model.predict.remote([4.0, 5.0])
-    stats = await model.get_stats.remote()
+    p1 = await (await model.predict.remote([1.0, 2.0, 3.0])).get()
+    p2 = await (await model.predict.remote([4.0, 5.0])).get()
+    stats = await (await model.get_stats.remote()).get()
 
     print("Predictions:", p1, p2)
     print("Stats:", stats)
@@ -190,14 +193,13 @@ if __name__ == "__main__":
 
 ---
 
-### 2.3. Actor Memory Self-Protection
+### 2.3. Actor Memory Management & Lifecycle
 
-To prevent memory leaks from abandoned actors and protect workers from running out of RAM (OOM), PyMapReduce provides built-in memory protection:
+To prevent memory leaks and protect workers from running out of RAM, PyMapReduce provides built-in lifecycle management:
 
-- **Idle Timeout (TTL)**: Automatically unload the actor instance if no calls are received for a specified duration.
-- **Global LRU Eviction**: Evict the least recently used actor when the worker's actor limit is reached.
-- **Lazy Re-creation**: If an evicted actor is called again, it transparently reconstructs itself.
-- **RAM Safety Watchdog**: Proactively unloads idle actors and clears GPU VRAM cache when system RAM exceeds 85%.
+- **Idle Timeout (TTL)**: Automatically unloads the actor instance if no calls are received for a specified duration.
+- **Explicit Kill**: Call `await pymapreduce.kill(actor)` or `await actor.destroy.remote()` to immediately free allocated resources.
+- **Resource Hook**: Define a `close()` method in your class to perform custom cleanup (closing file handles, flushing DB connections) when the actor is destroyed.
 
 ```python
 @pymapreduce.remote(idle_timeout=60.0)  # Auto-unload after 60s of inactivity
@@ -209,7 +211,7 @@ class HeavyService:
         return self.cache.setdefault(key, f"val_{key}")
 
     def close(self):
-        """Optional hook called when actor is unloaded or destroyed."""
+        """Called automatically when actor is destroyed."""
         print("Releasing resources...")
 ```
 
@@ -217,14 +219,14 @@ class HeavyService:
 
 ### 2.4. Automatic Code Shipping (`runtime_env`)
 
-When distributing code across multiple physical servers, use `runtime_env` to automatically package and synchronize your project folder (respecting `.gitignore`):
+When distributing code across physical servers, use `runtime_env` to automatically package and synchronize your local project folder (respecting `.gitignore`):
 
 ```python
 import asyncio
 import pymapreduce
 
 async def main():
-    # Connect and automatically package & sync local project files to all workers
+    # Automatically package & sync local project files to all cluster workers
     driver = await pymapreduce.connect(
         "192.168.1.10:7777",
         runtime_env={
@@ -264,8 +266,9 @@ async def main():
     # 1. Returns an ObjectRef handle
     df_ref = await create_dataframe.remote(rows=500_000)
 
-    # 2. Pass reference directly into next task (zero serialization)
-    summary = await compute_summary.remote(df_ref)
+    # 2. Pass reference directly into next task (zero network copy if collocated)
+    summary_ref = await compute_summary.remote(df_ref)
+    summary = await summary_ref.get()
     print("Summary:", summary)
 
     # 3. Or fetch the value locally
@@ -291,15 +294,12 @@ async def main():
     await pymapreduce.connect_worker("127.0.0.1:7777", cpus=4)
 
     # 1. Create dataset from items, CSV, or Pandas
-    ds = pymapreduce.from_items(range(1, 100_001), num_partitions=8)
-    # Alternatively: ds = await pymapreduce.read_csv("data/*.csv", num_partitions=8)
+    ds = await pymapreduce.from_items(range(1, 100_001), num_partitions=8)
 
     # 2. Lazy transformation pipeline
-    transformed = (
-        ds.map(lambda x: x * 2)
-          .filter(lambda x: x % 4 == 0)
-          .persist(pymapreduce.StorageLevel.MEMORY_ONLY)
-    )
+    transformed = await (
+        await ds.map(lambda x: x * 2)
+    ).filter(lambda x: x % 4 == 0)
 
     # 3. Actions & Conversions
     count = await transformed.count()
@@ -314,9 +314,9 @@ if __name__ == "__main__":
 
 ---
 
-### 2.7. Job Execution Timeouts
+### 2.7. Job Timeouts & Task Cancellation
 
-Prevent hung jobs by configuring a watchdog execution timeout:
+Prevent hung jobs by configuring execution timeouts:
 
 ```python
 import asyncio
@@ -326,10 +326,10 @@ async def main():
     driver = await pymapreduce.init()
     await pymapreduce.connect_worker("127.0.0.1:7777", cpus=4)
 
-    # Set a maximum execution timeout of 30 seconds for this job
+    # Set maximum execution timeout of 30 seconds for this job
     config = pymapreduce.JobConfig("AnalyticsJob", max_time=30)
     
-    # Submit job
+    # Submit job through driver
     results = await driver.submit(config)
 ```
 
@@ -351,7 +351,7 @@ await pymapreduce.connect_worker("127.0.0.1:7777", cpus=4)
 
 ### 3.2. Multi-Server Production Cluster
 
-Deploy across multiple servers using the `mapreduce` CLI:
+Deploy across multiple physical servers using the `mapreduce` CLI:
 
 ```bash
 # 1. Master Server (192.168.1.10): Start Head Node
@@ -373,6 +373,28 @@ driver = await pymapreduce.connect(
 )
 ```
 
+### 3.3. Docker & Kubernetes Deployment
+
+When deploying inside Docker containers, set `init: true` to ensure clean process reaping:
+
+```yaml
+version: '3.8'
+services:
+  headnode:
+    image: pymapreduce:latest
+    init: true
+    command: ["mapreduce", "start", "--head", "--port", "7777"]
+    ports:
+      - "7777:7777"
+
+  workernode:
+    image: pymapreduce:latest
+    init: true
+    command: ["mapreduce", "start", "--worker", "--head-addr", "headnode:7777"]
+    depends_on:
+      - headnode
+```
+
 ---
 
 ## 4. Task Scheduling Strategies
@@ -392,14 +414,14 @@ Configure how tasks are scheduled across available workers:
       <td><strong>Adaptive</strong><br><em>(Default)</em></td>
       <td><code>SchedulerStrategy.Adaptive</code><br><code>--scheduler Adaptive</code></td>
       <td>
-        Evaluates real-time network bandwidth (EMA), CPU load, and data locality. Best for production multi-node clusters.
+        Evaluates real-time network bandwidth (EMA), CPU load, and data locality. Best for heterogeneous production clusters.
       </td>
     </tr>
     <tr>
       <td><strong>LocalityFirst</strong></td>
       <td><code>SchedulerStrategy.LocalityFirst</code><br><code>--scheduler LocalityFirst</code></td>
       <td>
-        Prioritizes dispatching tasks to the worker already holding required data in RAM to minimize network transfer.
+        Prioritizes dispatching tasks to the worker already holding required data in RAM to minimize network transfers.
       </td>
     </tr>
     <tr>
@@ -413,14 +435,14 @@ Configure how tasks are scheduled across available workers:
       <td><strong>WeightedCapacity</strong></td>
       <td><code>SchedulerStrategy.WeightedCapacity</code><br><code>--scheduler WeightedCapacity</code></td>
       <td>
-        Weights assignment based on each worker's physical CPU cores and RAM size.
+        Weights assignment based on each worker's physical CPU cores and available RAM size.
       </td>
     </tr>
     <tr>
       <td><strong>RoundRobin</strong></td>
       <td><code>SchedulerStrategy.RoundRobin</code><br><code>--scheduler RoundRobin</code></td>
       <td>
-        Rotates tasks evenly across all available workers. Ideal for benchmark baselines.
+        Rotates tasks evenly across all available workers. Ideal for baseline benchmarking.
       </td>
     </tr>
   </tbody>
@@ -434,10 +456,10 @@ Configure how tasks are scheduled across available workers:
 # Start cluster coordinator (HeadNode)
 mapreduce start --head --port 7777 --scheduler Adaptive
 
-# Connect a worker node
-mapreduce start --worker --head-addr 127.0.0.1:7777 --cpus 8
+# Connect a worker node with 8 CPUs and 300s idle timeout
+mapreduce start --worker --head-addr 127.0.0.1:7777 --cpus 8 --idle-timeout 300
 
-# Submit a standalone script with a 60-second timeout
+# Submit a standalone script with a 60-second watchdog timeout
 mapreduce submit pipeline.py --head-addr 127.0.0.1:7777 --max-time 60
 ```
 
@@ -479,17 +501,17 @@ mapreduce submit pipeline.py --head-addr 127.0.0.1:7777 --max-time 60
     <tr>
       <td><code>pymapreduce.kill(...)</code></td>
       <td><code>actor_handle</code></td>
-      <td>Asynchronously purges an actor instance from worker memory and cluster state.</td>
+      <td>Asynchronously purges an actor instance from worker memory and cluster registry.</td>
     </tr>
     <tr>
       <td><code>pymapreduce.from_items(...)</code></td>
       <td><code>items, num_partitions=None</code></td>
-      <td>Creates a distributed <code>Dataset</code> from in-memory items.</td>
+      <td>Creates a distributed <code>Dataset</code> from in-memory sequences.</td>
     </tr>
     <tr>
       <td><code>pymapreduce.read_csv(...)</code></td>
       <td><code>path_or_glob, num_partitions=None</code></td>
-      <td>Creates a distributed <code>Dataset</code> by chunking a CSV file.</td>
+      <td>Creates a distributed <code>Dataset</code> by chunking CSV files.</td>
     </tr>
     <tr>
       <td><code>pymapreduce.from_pandas(...)</code></td>
@@ -547,17 +569,17 @@ mapreduce submit pipeline.py --head-addr 127.0.0.1:7777 --max-time 60
     </tr>
     <tr>
       <td><code>Dataset</code></td>
-      <td><code>map(fn)</code> / <code>filter(fn)</code> / <code>flat_map(fn)</code></td>
+      <td><code>await ds.map(fn)</code> / <code>filter(fn)</code> / <code>flat_map(fn)</code></td>
       <td>Applies transformations across distributed partitions.</td>
     </tr>
     <tr>
       <td><code>Dataset</code></td>
-      <td><code>map_batches(fn, batch_format="pandas")</code></td>
+      <td><code>await ds.map_batches(fn, batch_format="pandas")</code></td>
       <td>Applies batch transformations using Pandas, PyArrow, or NumPy.</td>
     </tr>
     <tr>
       <td><code>Dataset</code></td>
-      <td><code>count()</code> / <code>take(n)</code> / <code>collect()</code></td>
+      <td><code>await ds.count()</code> / <code>take(n)</code> / <code>collect()</code></td>
       <td>Executes the pipeline and returns results.</td>
     </tr>
     <tr>

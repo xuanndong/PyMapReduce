@@ -48,7 +48,7 @@ def start_worker(head_addr, cpus, idle_timeout):
             print(f"[MapReduce] Starting Worker Node connecting to {head_addr} with {cpus} cores...")
             
         if idle_timeout > 0:
-            print(f"[MapReduce] Idle timeout set to {idle_timeout} minutes")
+            print(f"[MapReduce] Idle timeout set to {idle_timeout} seconds")
         else:
             print(f"[MapReduce] Idle timeout disabled (processes live forever)")
             
@@ -75,7 +75,7 @@ def main():
     start_parser.add_argument("--head-addr", type=str, default="127.0.0.1:7777", help="IP address of the Head Node (e.g., 192.168.1.100:7777)")
     start_parser.add_argument("--port", type=int, default=7777, help="Port for the Head Node to listen on (default: 7777)")
     start_parser.add_argument("--cpus", type=int, default=None, help="Number of CPU cores the worker should use. Defaults to all available cores.")
-    start_parser.add_argument("--idle-timeout", type=int, default=0, help="Kill worker processes if idle for this many minutes (0 = never timeout).")
+    start_parser.add_argument("--idle-timeout", type=int, default=0, help="Kill worker processes if idle for this many seconds (0 = never timeout).")
     start_parser.add_argument("--scheduler", type=str, default="RoundRobin", choices=["RoundRobin", "WeightedCapacity", "LeastLoad", "LocalityFirst", "Adaptive"], help="Scheduling strategy for Head Node")
 
     submit_parser = subparsers.add_parser("submit", help="Submit a Python script to the cluster")

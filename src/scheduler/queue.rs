@@ -73,7 +73,7 @@ impl TaskQueue {
         match &task.kind {
             crate::types::task::TaskKind::ActorTask { actor_id, .. }
             | crate::types::task::TaskKind::ActorDestruction { actor_id } => {
-                let mailbox = self.actor_mailboxes.entry(*actor_id).or_insert_with(VecDeque::new);
+                let mailbox = self.actor_mailboxes.entry(*actor_id).or_default();
                 mailbox.push_back(task);
                 return;
             }
@@ -134,6 +134,47 @@ impl TaskQueue {
         }
     }
 
+    pub fn cancel_job_tasks(&mut self, job_id: uuid::Uuid) -> Vec<uuid::Uuid> {
+        let mut cancelled_ids = Vec::new();
+
+        let old_pending = std::mem::take(&mut self.pending);
+        let mut kept = Vec::new();
+        for pt in old_pending.into_vec() {
+            if pt.task.job_id == job_id {
+                cancelled_ids.push(pt.task.id);
+            } else {
+                kept.push(pt);
+            }
+        }
+        self.pending = std::collections::BinaryHeap::from(kept);
+
+        for queue in self.locality.values_mut() {
+            queue.retain(|t| {
+                if t.job_id == job_id {
+                    cancelled_ids.push(t.id);
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        self.locality.retain(|_, q| !q.is_empty());
+
+        for queue in self.actor_mailboxes.values_mut() {
+            queue.retain(|t| {
+                if t.job_id == job_id {
+                    cancelled_ids.push(t.id);
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        self.actor_mailboxes.retain(|_, q| !q.is_empty());
+
+        cancelled_ids
+    }
+
     pub fn is_empty(&self) -> bool {
         self.pending.is_empty() 
             && self.locality.is_empty()
@@ -181,5 +222,52 @@ mod tests {
 
         let popped2 = q.pop().unwrap();
         assert_eq!(popped2.id, t1.id);
+    }
+
+    #[test]
+    fn test_cancel_job_tasks() {
+        let mut q = TaskQueue::new();
+        let job1 = Uuid::new_v4();
+        let job2 = Uuid::new_v4();
+
+        let t1 = Task {
+            id: Uuid::new_v4(),
+            job_id: job1,
+            kind: TaskKind::Map,
+            payload: Vec::new(),
+            runtime_env: None,
+            dependencies: vec![],
+        };
+        let t2 = Task {
+            id: Uuid::new_v4(),
+            job_id: job2,
+            kind: TaskKind::Map,
+            payload: Vec::new(),
+            runtime_env: None,
+            dependencies: vec![],
+        };
+        let t3 = Task {
+            id: Uuid::new_v4(),
+            job_id: job1,
+            kind: TaskKind::Map,
+            payload: Vec::new(),
+            runtime_env: None,
+            dependencies: vec![],
+        };
+
+        q.push(t1.clone());
+        q.push(t2.clone());
+        q.push(t3.clone());
+
+        assert_eq!(q.len(), 3);
+
+        let cancelled = q.cancel_job_tasks(job1);
+        assert_eq!(cancelled.len(), 2);
+        assert!(cancelled.contains(&t1.id));
+        assert!(cancelled.contains(&t3.id));
+
+        assert_eq!(q.len(), 1);
+        let remaining = q.pop().unwrap();
+        assert_eq!(remaining.id, t2.id);
     }
 }

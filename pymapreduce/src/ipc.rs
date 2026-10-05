@@ -7,6 +7,7 @@ pub struct IpcWorker {
     pub child: Child,
     pub stdin: ChildStdin,
     pub stdout: ChildStdout,
+    pub pid: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -49,19 +50,43 @@ impl IpcWorker {
             }
         }
 
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         unsafe {
             cmd.pre_exec(|| {
+                #[cfg(target_os = "linux")]
                 libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+                // Create a distinct process group for this worker and all its ML children
+                libc::setpgid(0, 0);
                 Ok(())
             });
         }
 
         let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+        let pid = child.id();
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
         
-        Ok(Self { child, stdin, stdout })
+        Ok(Self { child, stdin, stdout, pid })
+    }
+
+    #[cfg(unix)]
+    pub fn kill_group(&mut self, sig: libc::c_int) -> Result<(), std::io::Error> {
+        if let Some(pid) = self.pid {
+            let pgid = pid as i32;
+            let res = unsafe { libc::kill(-pgid, sig) };
+            if res != 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(err);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    pub async fn kill_group(&mut self, _sig: i32) -> Result<(), std::io::Error> {
+        self.child.kill().await
     }
     
     pub async fn send_and_receive(&mut self, payload: Vec<u8>) -> Result<Vec<u8>, IpcError> {

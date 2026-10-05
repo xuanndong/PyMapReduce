@@ -14,6 +14,8 @@ except ImportError:
 
 import pymapreduce
 
+import signal
+
 # Global store for active actors and metadata within this worker process
 _ACTORS = {}
 _ACTOR_META = {}
@@ -73,6 +75,18 @@ def _unload_actor(actor_id: str, remove_meta: bool = False) -> bool:
         _teardown_instance(instance)
         return True
     return False
+
+
+def _sigterm_handler(signum, frame):
+    """Gracefully clean up GPU VRAM, actor instances, and memory pools on SIGTERM."""
+    for actor_id in list(_ACTORS.keys()):
+        _unload_actor(actor_id, remove_meta=True)
+    _collect_garbage()
+    sys.exit(0)
+
+
+signal.signal(signal.SIGTERM, _sigterm_handler)
+
 
 
 def _get_system_memory_percent() -> float:
