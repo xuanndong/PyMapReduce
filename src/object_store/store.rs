@@ -186,6 +186,8 @@ impl ObjectStore {
             tokio::fs::remove_file(warm_path).await.map_err(FrameworkError::Io)?;
         }
 
+        self.waiters.remove(&id);
+
         Ok(())
     }
 
@@ -205,6 +207,34 @@ impl ObjectStore {
         }
 
         future.await;
+    }
+
+    pub async fn wait_for_object_timeout(
+        &self,
+        id: ObjectId,
+        timeout: std::time::Duration,
+    ) -> Result<Bytes> {
+        let notify = self
+            .waiters
+            .entry(id)
+            .or_insert_with(|| Arc::new(tokio::sync::Notify::new()))
+            .clone();
+
+        let future = notify.notified();
+        tokio::pin!(future);
+        future.as_mut().enable();
+
+        if let Ok(data) = self.get_any(id).await {
+            return Ok(data);
+        }
+
+        match tokio::time::timeout(timeout, future).await {
+            Ok(()) => self.get_any(id).await,
+            Err(_) => Err(FrameworkError::Other(format!(
+                "Timed out waiting for object {} after {:?}",
+                id, timeout
+            ))),
+        }
     }
 
     // Helper functions

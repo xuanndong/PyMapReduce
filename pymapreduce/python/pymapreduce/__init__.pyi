@@ -94,17 +94,19 @@ class Driver:
     def put(self, object_id: str, data: bytes) -> Coroutine[Any, Any, None]: ...
     def get(self, object_id: str) -> Coroutine[Any, Any, Any]: ...
 
-def connect_worker(head_addr: str, cpus: Optional[int] = None, idle_timeout: int = 0) -> Coroutine[Any, Any, WorkerHandle]:
+def connect_worker(head_addr: str, cpus: Optional[int] = None, idle_timeout: int = 0, standby: bool = False) -> Coroutine[Any, Any, WorkerHandle]:
     """
     Connects a new worker to the cluster and returns a WorkerHandle for lifecycle control.
+    If standby=True, the worker registers in warm standby mode for auto-scaling.
     """
     pass
 
-def start_worker(head_addr: str, workers: Optional[int] = None, idle_timeout: int = 0) -> Coroutine[Any, Any, None]:
+def start_worker(head_addr: str, workers: Optional[int] = None, idle_timeout: int = 0, standby: bool = False) -> Coroutine[Any, Any, None]:
     """
     Connects to an existing HeadNode and starts accepting tasks.
     By default, uses all available CPU cores.
     If idle_timeout > 0, kills idle python processes after that many seconds.
+    If standby=True, the worker starts in warm standby mode for auto-scaling.
     """
     pass
 

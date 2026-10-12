@@ -40,6 +40,9 @@ pub trait SchedulingStrategy: Send + Sync + 'static {
 
 // Helper to poll pending tasks for alive actors hosted on this worker
 fn poll_actor_task(queue: &mut TaskQueue, worker: &WorkerInfo, gcs: &GcsState) -> Option<Task> {
+    if worker.is_elastic {
+        return None;
+    }
     for (actor_id, actor_rec) in &gcs.actors {
         if actor_rec.status == crate::gcs::state::ActorStatus::Alive
             && actor_rec.worker_id == Some(worker.id)
@@ -50,6 +53,15 @@ fn poll_actor_task(queue: &mut TaskQueue, worker: &WorkerInfo, gcs: &GcsState) -
         }
     }
     None
+}
+
+// Helper to poll pending general tasks (Elastic workers only pop stateless Map/Reduce)
+fn poll_general_task(queue: &mut TaskQueue, worker: &WorkerInfo) -> Option<Task> {
+    if worker.is_elastic {
+        queue.pop_stateless()
+    } else {
+        queue.pop()
+    }
 }
 
 // 1. RoundRobinStrategy
@@ -78,12 +90,16 @@ impl SchedulingStrategy for RoundRobinStrategy {
         worker: &WorkerInfo,
         gcs: &GcsState,
     ) -> Option<Task> {
+        if worker.status != crate::types::node::NodeStatus::Active {
+            return None;
+        }
+
         if let Some(task) = poll_actor_task(queue, worker, gcs) {
             return Some(task);
         }
 
         self.counter.fetch_add(1, Ordering::Relaxed);
-        queue.pop()
+        poll_general_task(queue, worker)
     }
     fn name(&self) -> &'static str {
         "RoundRobin"
@@ -99,6 +115,10 @@ impl SchedulingStrategy for WeightedCapacityStrategy {
         worker: &WorkerInfo,
         gcs: &GcsState,
     ) -> Option<Task> {
+        if worker.status != crate::types::node::NodeStatus::Active {
+            return None;
+        }
+
         if let Some(task) = poll_actor_task(queue, worker, gcs) {
             return Some(task);
         }
@@ -107,6 +127,10 @@ impl SchedulingStrategy for WeightedCapacityStrategy {
         let mut best_score = f64::MIN;
         
         for (w_id, info) in &gcs.nodes {
+            if info.status != crate::types::node::NodeStatus::Active {
+                continue;
+            }
+
             let load = gcs.worker_load.get(w_id).copied().unwrap_or(0);
             let capacity = info.capacity.physical_cpus as f64 + (info.capacity.total_ram_mb as f64 / 1024.0);
             
@@ -125,7 +149,7 @@ impl SchedulingStrategy for WeightedCapacityStrategy {
             return None;
         }
         
-        queue.pop()
+        poll_general_task(queue, worker)
     }
     fn name(&self) -> &'static str {
         "WeightedCapacity"
@@ -141,6 +165,10 @@ impl SchedulingStrategy for LeastLoadStrategy {
         worker: &WorkerInfo,
         gcs: &GcsState,
     ) -> Option<Task> {
+        if worker.status != crate::types::node::NodeStatus::Active {
+            return None;
+        }
+
         if let Some(task) = poll_actor_task(queue, worker, gcs) {
             return Some(task);
         }
@@ -148,7 +176,11 @@ impl SchedulingStrategy for LeastLoadStrategy {
         let mut my_load = 0;
         let mut min_load = usize::MAX;
         
-        for w_id in gcs.nodes.keys() {
+        for (w_id, info) in &gcs.nodes {
+            if info.status != crate::types::node::NodeStatus::Active {
+                continue;
+            }
+
             let load = gcs.worker_load.get(w_id).copied().unwrap_or(0);
             if load < min_load {
                 min_load = load;
@@ -162,7 +194,7 @@ impl SchedulingStrategy for LeastLoadStrategy {
             return None;
         }
         
-        queue.pop()
+        poll_general_task(queue, worker)
     }
     fn name(&self) -> &'static str {
         "LeastLoad"
@@ -178,13 +210,17 @@ impl SchedulingStrategy for LocalityFirstStrategy {
         worker: &WorkerInfo,
         gcs: &GcsState,
     ) -> Option<Task> {
+        if worker.status != crate::types::node::NodeStatus::Active {
+            return None;
+        }
+
         if let Some(task) = poll_actor_task(queue, worker, gcs) {
             return Some(task);
         }
 
         queue
             .pop_by_locality(&worker.id.to_string())
-            .or_else(|| queue.pop())
+            .or_else(|| poll_general_task(queue, worker))
     }
     fn name(&self) -> &'static str {
         "LocalityFirst"
@@ -200,13 +236,17 @@ impl SchedulingStrategy for AdaptiveStrategy {
         worker: &WorkerInfo,
         gcs: &GcsState,
     ) -> Option<Task> {
+        if worker.status != crate::types::node::NodeStatus::Active {
+            return None;
+        }
+
         if let Some(task) = poll_actor_task(queue, worker, gcs) {
             return Some(task);
         }
 
         queue
             .pop_by_locality(&worker.id.to_string())
-            .or_else(|| queue.pop())
+            .or_else(|| poll_general_task(queue, worker))
             .or_else(|| queue.steal_any_local())
     }
     fn name(&self) -> &'static str {
@@ -217,7 +257,7 @@ impl SchedulingStrategy for AdaptiveStrategy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::node::{NodeCapacity, NodeInfo, WorkerId};
+    use crate::types::node::{NodeCapacity, NodeInfo, NodeStatus, WorkerId};
     use crate::types::task::{Task, TaskKind};
     use uuid::Uuid;
 
@@ -240,6 +280,8 @@ mod tests {
                 total_ram_mb: ram_mb,
             },
             addr: "127.0.0.1:8000".to_string(),
+            status: NodeStatus::Active,
+            is_elastic: false,
         }
     }
 
@@ -300,4 +342,104 @@ mod tests {
         let task_large = strategy.poll_next_task(&mut queue, &w_large, &gcs);
         assert!(task_large.is_some());
     }
+
+    #[test]
+    fn test_standby_worker_rejected_by_all_strategies() {
+        let mut queue = TaskQueue::new();
+        queue.push(create_dummy_task());
+
+        let gcs = GcsState::new();
+        let standby_id = Uuid::new_v4();
+        let mut standby_worker = create_dummy_worker(standby_id, 16, 32768);
+        standby_worker.status = NodeStatus::Standby;
+
+        let strategies: Vec<Box<dyn SchedulingStrategy>> = vec![
+            Box::new(RoundRobinStrategy::new()),
+            Box::new(WeightedCapacityStrategy),
+            Box::new(LeastLoadStrategy),
+            Box::new(LocalityFirstStrategy),
+            Box::new(AdaptiveStrategy),
+        ];
+
+        for strat in strategies {
+            let task = strat.poll_next_task(&mut queue, &standby_worker, &gcs);
+            assert!(
+                task.is_none(),
+                "Strategy {} should return None for Standby worker",
+                strat.name()
+            );
+        }
+    }
+
+    #[test]
+    fn test_active_worker_not_blocked_by_standby_worker() {
+        let mut queue = TaskQueue::new();
+        queue.push(create_dummy_task());
+
+        let mut gcs = GcsState::new();
+        let w_active_id = Uuid::new_v4();
+        let w_standby_id = Uuid::new_v4();
+
+        let w_active = create_dummy_worker(w_active_id, 4, 8192);
+        let mut w_standby = create_dummy_worker(w_standby_id, 32, 65536);
+        w_standby.status = NodeStatus::Standby;
+
+        gcs.nodes.insert(w_active_id, w_active.clone());
+        gcs.nodes.insert(w_standby_id, w_standby.clone());
+
+        // Active worker has load 2, Standby worker has load 0
+        gcs.worker_load.insert(w_active_id, 2);
+        gcs.worker_load.insert(w_standby_id, 0);
+
+        // LeastLoad should give task to active worker despite having higher load than standby
+        let least_load = LeastLoadStrategy;
+        let task = least_load.poll_next_task(&mut queue, &w_active, &gcs);
+        assert!(task.is_some(), "LeastLoad must ignore standby node load");
+
+        // WeightedCapacity should also ignore standby node's massive capacity
+        queue.push(create_dummy_task());
+        let weighted = WeightedCapacityStrategy;
+        let task2 = weighted.poll_next_task(&mut queue, &w_active, &gcs);
+        assert!(task2.is_some(), "WeightedCapacity must ignore standby node capacity");
+    }
+
+    #[test]
+    fn test_elastic_worker_rejects_actor_creation_and_pops_stateless() {
+        let mut queue = TaskQueue::new();
+        let actor_creation_task = Task {
+            id: Uuid::new_v4(),
+            job_id: Uuid::new_v4(),
+            kind: TaskKind::ActorCreation {
+                actor_id: Uuid::new_v4(),
+                class_name: "MyActor".to_string(),
+            },
+            payload: vec![],
+            runtime_env: None,
+            dependencies: vec![],
+        };
+        let map_task = create_dummy_task();
+
+        // Enqueue ActorCreation first (higher priority / older seq), then Map task
+        queue.push(actor_creation_task.clone());
+        queue.push(map_task.clone());
+
+        let gcs = GcsState::new();
+        let elastic_w_id = Uuid::new_v4();
+        let mut elastic_worker = create_dummy_worker(elastic_w_id, 8, 16384);
+        elastic_worker.is_elastic = true;
+
+        let core_w_id = Uuid::new_v4();
+        let core_worker = create_dummy_worker(core_w_id, 8, 16384);
+
+        let strategy = RoundRobinStrategy::new();
+
+        // Elastic worker must skip ActorCreation and receive the Map task!
+        let polled_elastic = strategy.poll_next_task(&mut queue, &elastic_worker, &gcs).expect("Should get map task");
+        assert_eq!(polled_elastic.id, map_task.id, "Elastic worker must only get stateless tasks");
+
+        // Core worker gets the remaining ActorCreation task!
+        let polled_core = strategy.poll_next_task(&mut queue, &core_worker, &gcs).expect("Should get actor creation task");
+        assert_eq!(polled_core.id, actor_creation_task.id, "Core worker must receive actor creation task");
+    }
 }
+

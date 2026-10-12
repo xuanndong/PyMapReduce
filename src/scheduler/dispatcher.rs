@@ -38,4 +38,12 @@ impl Dispatcher {
         let mut q = self.queue.lock();
         self.strategy.poll_next_task(&mut q, worker, gcs)
     }
+
+    pub fn pending_task_count(&self) -> usize {
+        self.queue.lock().len()
+    }
+
+    pub fn stateless_task_count(&self) -> usize {
+        self.queue.lock().stateless_task_count()
+    }
 }

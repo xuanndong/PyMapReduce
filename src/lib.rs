@@ -7,6 +7,8 @@ pub mod protocol;
 pub mod scheduler;
 pub mod types;
 
+pub use cluster::head::{HeadNode, HeadNodeConfig};
+pub use cluster::worker::WorkerNode;
 pub use driver::{
     config::{JobConfig, TaskInput},
     handle::JobHandle,

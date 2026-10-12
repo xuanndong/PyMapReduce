@@ -26,12 +26,23 @@ pub struct NodeInfo {
     pub id: NodeId,
     pub capacity: NodeCapacity,
     pub addr: String,
+    #[serde(default)]
+    pub status: NodeStatus,
+    #[serde(default)]
+    pub is_elastic: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum NodeStatus {
     Active,
+    Standby,
     Draining,
     Dead,
     Offline,
+}
+
+impl Default for NodeStatus {
+    fn default() -> Self {
+        Self::Active
+    }
 }

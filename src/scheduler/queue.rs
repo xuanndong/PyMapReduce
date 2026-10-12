@@ -93,6 +93,28 @@ impl TaskQueue {
         self.pending.pop().map(|pt| pt.task)
     }
 
+    /// Pops the next task from pending that is NOT a Stateful Actor task (Map/Reduce only).
+    /// Used by Elastic / Standby workers to ensure actors are never placed on transient nodes.
+    pub fn pop_stateless(&mut self) -> Option<Task> {
+        let mut skipped = Vec::new();
+        let mut result = None;
+
+        while let Some(pt) = self.pending.pop() {
+            if matches!(pt.task.kind, crate::types::task::TaskKind::ActorCreation { .. }) {
+                skipped.push(pt);
+            } else {
+                result = Some(pt.task);
+                break;
+            }
+        }
+
+        for pt in skipped {
+            self.pending.push(pt);
+        }
+
+        result
+    }
+
     pub fn pop_for_actor(&mut self, actor_id: &crate::types::task::ActorId) -> Option<Task> {
         if let Some(queue) = self.actor_mailboxes.get_mut(actor_id) {
             let task = queue.pop_front();
@@ -185,6 +207,17 @@ impl TaskQueue {
         let local_len: usize = self.locality.values().map(|q| q.len()).sum();
         let actor_len: usize = self.actor_mailboxes.values().map(|q| q.len()).sum();
         self.pending.len() + local_len + actor_len
+    }
+
+    /// Count pending tasks that are stateless (Map / Reduce), eligible for elastic workers.
+    pub fn stateless_task_count(&self) -> usize {
+        let stateless_pending = self
+            .pending
+            .iter()
+            .filter(|pt| !matches!(pt.task.kind, crate::types::task::TaskKind::ActorCreation { .. }))
+            .count();
+        let local_len: usize = self.locality.values().map(|q| q.len()).sum();
+        stateless_pending + local_len
     }
 }
 

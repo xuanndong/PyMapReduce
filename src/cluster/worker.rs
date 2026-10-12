@@ -95,6 +95,22 @@ impl WorkerSession {
             Message::Shutdown => {
                 return SessionAction::Break;
             }
+            Message::WakeUp => {
+                self.worker.is_standby.store(false, Ordering::Relaxed);
+                println!("[Worker {}] Woken up from standby by HeadNode!", self.worker.id);
+            }
+            Message::EnterStandby => {
+                self.worker.is_standby.store(true, Ordering::Relaxed);
+                let _ = self.tx.send(Message::WorkerEnteringStandby { worker_id: self.worker.id }).await;
+                println!("[Worker {}] Entered warm standby mode.", self.worker.id);
+            }
+            Message::RegisterAck { auto_scale_enabled } => {
+                if !auto_scale_enabled && self.worker.configured_standby.load(Ordering::Relaxed) {
+                    self.worker.configured_standby.store(false, Ordering::Relaxed);
+                    self.worker.is_standby.store(false, Ordering::Relaxed);
+                    println!("[Worker {}] HeadNode auto-scale disabled; adapted to active mode.", self.worker.id);
+                }
+            }
             Message::DeleteObject { object_id } => {
                 self.handle_delete_object(object_id).await;
             }
@@ -111,15 +127,44 @@ impl WorkerSession {
         self.worker.task_tracker.insert(task.id, TaskReconcileStatus::Running);
 
         let session = self.clone();
-        tokio::spawn(async move {
-            session.fetch_dependencies(&task).await;
+        let task_id = task.id;
+        let join_handle = tokio::spawn(async move {
+            if let Err(e) = session.fetch_dependencies(&task).await {
+                let err_msg = format!("Dependency fetch failed for task {}: {}", task.id, e);
+                eprintln!("{}", err_msg);
+                session.worker.running_tasks.remove(&task.id);
+                let msg = Message::TaskFailure {
+                    task_id: task.id,
+                    job_id: task.job_id,
+                    error: err_msg.clone(),
+                };
+                let tx_opt = session.worker.active_tx.read().clone().or(Some(session.tx.clone()));
+                let sent_ok = match tx_opt {
+                    Some(tx) => tx.send(msg).await.is_ok(),
+                    None => false,
+                };
+                if sent_ok {
+                    session.worker.task_tracker.remove(&task.id);
+                } else {
+                    session.worker.task_tracker.insert(
+                        task.id,
+                        TaskReconcileStatus::Failed {
+                            job_id: task.job_id,
+                            error: err_msg,
+                        },
+                    );
+                }
+                return;
+            }
 
             if let Some(env_id) = task.runtime_env {
                 session.prepare_runtime_env(env_id).await;
             }
 
-            session.spawn_task(task);
+            session.execute_task(task).await;
         });
+
+        self.worker.running_tasks.insert(task_id, join_handle.abort_handle());
     }
 
     async fn handle_cancel_task(&self, task_id: TaskId) {
@@ -165,7 +210,7 @@ impl WorkerSession {
         }
     }
 
-    async fn fetch_dependencies(&self, task: &Task) {
+    async fn fetch_dependencies(&self, task: &Task) -> Result<(), FrameworkError> {
         let mut all_deps = task.dependencies.clone();
         if let Some(env_id) = task.runtime_env {
             all_deps.push(env_id);
@@ -181,9 +226,13 @@ impl WorkerSession {
                         len: u64::MAX,
                     })
                     .await;
-                self.worker.store.wait_for_object(dep_id).await;
+                self.worker
+                    .store
+                    .wait_for_object_timeout(dep_id, std::time::Duration::from_secs(60))
+                    .await?;
             }
         }
+        Ok(())
     }
 
     async fn prepare_runtime_env(&self, env_id: uuid::Uuid) {
@@ -220,51 +269,58 @@ impl WorkerSession {
         }
     }
 
-    fn spawn_task(&self, task: Box<Task>) {
+    async fn execute_task(&self, task: Box<Task>) {
         let task_id = task.id;
         let running_clone = self.worker.running_tasks.clone();
         let semaphore_clone = self.semaphore.clone();
         let executor_clone = self.worker.executor.clone();
         let store_clone = self.worker.store.clone();
         let tracker_clone = self.worker.task_tracker.clone();
-        let tx_clone = self.tx.clone();
 
-        let join_handle = tokio::spawn(async move {
-            let Ok(permit) = semaphore_clone.acquire_owned().await else { return; };
-            let result = executor_clone.execute(&task, store_clone).await;
-            running_clone.remove(&task_id);
+        let Ok(permit) = semaphore_clone.acquire_owned().await else { return; };
+        let result = executor_clone.execute(&task, store_clone).await;
+        running_clone.remove(&task_id);
+        drop(permit);
 
-            let (msg, status) = match result {
-                Ok((output, object_id)) => (
-                    Message::TaskSuccess {
-                        task_id: task.id,
-                        job_id: task.job_id,
-                        output: output.clone(),
-                        object_id,
-                        observed_bandwidth_mbps: None,
-                    },
-                    TaskReconcileStatus::Completed {
-                        job_id: task.job_id,
-                        output,
-                        object_id,
-                    },
-                ),
-                Err(e) => (
-                    Message::TaskFailure {
-                        task_id: task.id,
-                        job_id: task.job_id,
-                        error: e.to_string(),
-                    },
-                    TaskReconcileStatus::Failed(e.to_string()),
-                ),
-            };
+        let (msg, status) = match result {
+            Ok((output, object_id)) => (
+                Message::TaskSuccess {
+                    task_id: task.id,
+                    job_id: task.job_id,
+                    output: output.clone(),
+                    object_id,
+                    observed_bandwidth_mbps: None,
+                },
+                TaskReconcileStatus::Completed {
+                    job_id: task.job_id,
+                    output,
+                    object_id,
+                },
+            ),
+            Err(e) => (
+                Message::TaskFailure {
+                    task_id: task.id,
+                    job_id: task.job_id,
+                    error: e.to_string(),
+                },
+                TaskReconcileStatus::Failed {
+                    job_id: task.job_id,
+                    error: e.to_string(),
+                },
+            ),
+        };
 
-            tracker_clone.insert(task.id, status);
-            let _ = tx_clone.send(msg).await;
-            drop(permit);
-        });
+        let tx_opt = self.worker.active_tx.read().clone().or(Some(self.tx.clone()));
+        let sent_ok = match tx_opt {
+            Some(tx) => tx.send(msg).await.is_ok(),
+            None => false,
+        };
 
-        self.worker.running_tasks.insert(task_id, join_handle.abort_handle());
+        if sent_ok {
+            tracker_clone.remove(&task_id);
+        } else {
+            tracker_clone.insert(task_id, status);
+        }
     }
 }
 
@@ -280,6 +336,9 @@ pub struct WorkerNode {
     pub task_tracker: Arc<DashMap<TaskId, TaskReconcileStatus>>,
     pub running_tasks: Arc<DashMap<TaskId, tokio::task::AbortHandle>>,
     pub is_draining: Arc<AtomicBool>,
+    pub is_standby: Arc<AtomicBool>,
+    pub configured_standby: Arc<AtomicBool>,
+    pub active_tx: Arc<parking_lot::RwLock<Option<mpsc::Sender<Message>>>>,
     control_tx: mpsc::Sender<WorkerControl>,
     control_rx: Arc<Mutex<mpsc::Receiver<WorkerControl>>>,
 }
@@ -297,9 +356,18 @@ impl WorkerNode {
             task_tracker: Arc::new(DashMap::new()),
             running_tasks: Arc::new(DashMap::new()),
             is_draining: Arc::new(AtomicBool::new(false)),
+            is_standby: Arc::new(AtomicBool::new(false)),
+            configured_standby: Arc::new(AtomicBool::new(false)),
+            active_tx: Arc::new(parking_lot::RwLock::new(None)),
             control_tx,
             control_rx: Arc::new(Mutex::new(control_rx)),
         }
+    }
+
+    pub fn with_standby(self, standby: bool) -> Self {
+        self.configured_standby.store(standby, Ordering::Relaxed);
+        self.is_standby.store(standby, Ordering::Relaxed);
+        self
     }
 
     pub fn with_listener(mut self, listener_addr: String) -> Self {
@@ -344,12 +412,15 @@ impl WorkerNode {
     }
 
     async fn reconcile_and_report(&self, framed: &mut Framed<TcpStream, MessageCodec>) -> Result<(), FrameworkError> {
+        let standby_mode = self.configured_standby.load(Ordering::Relaxed);
         let report_ready = Message::ReportReady {
             worker_id: self.id,
             cache_hint: None,
             capacity: self.capacity.clone(),
             listener_addr: self.listener_addr.clone(),
+            standby: standby_mode,
         };
+        self.is_standby.store(standby_mode, Ordering::Relaxed);
 
         framed
             .send(report_ready)
@@ -358,17 +429,30 @@ impl WorkerNode {
 
         let mut sent_task_ids = Vec::new();
         for entry in self.task_tracker.iter() {
-            if let TaskReconcileStatus::Completed { job_id, output, object_id } = entry.value() {
-                let msg = Message::TaskSuccess {
-                    task_id: *entry.key(),
-                    job_id: *job_id,
-                    output: output.clone(),
-                    object_id: *object_id,
-                    observed_bandwidth_mbps: None,
-                };
-                if framed.send(msg).await.is_ok() {
-                    sent_task_ids.push(*entry.key());
+            match entry.value() {
+                TaskReconcileStatus::Completed { job_id, output, object_id } => {
+                    let msg = Message::TaskSuccess {
+                        task_id: *entry.key(),
+                        job_id: *job_id,
+                        output: output.clone(),
+                        object_id: *object_id,
+                        observed_bandwidth_mbps: None,
+                    };
+                    if framed.send(msg).await.is_ok() {
+                        sent_task_ids.push(*entry.key());
+                    }
                 }
+                TaskReconcileStatus::Failed { job_id, error } => {
+                    let msg = Message::TaskFailure {
+                        task_id: *entry.key(),
+                        job_id: *job_id,
+                        error: error.clone(),
+                    };
+                    if framed.send(msg).await.is_ok() {
+                        sent_task_ids.push(*entry.key());
+                    }
+                }
+                _ => {}
             }
         }
         for task_id in sent_task_ids {
@@ -383,6 +467,7 @@ impl WorkerNode {
         control_rx: &mut mpsc::Receiver<WorkerControl>,
     ) -> bool {
         let (tx, mut rx) = mpsc::channel::<Message>(100);
+        *self.active_tx.write() = Some(tx.clone());
         let session = WorkerSession::new(self.clone(), tx.clone());
         let heartbeat_handle = session.start_heartbeat();
 
@@ -424,6 +509,7 @@ impl WorkerNode {
         }
 
         heartbeat_handle.abort();
+        *self.active_tx.write() = None;
         should_reconnect
     }
 

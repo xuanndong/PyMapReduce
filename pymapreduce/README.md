@@ -2,7 +2,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/version-0.1.14-blue.svg?style=flat-square)](https://pypi.org/project/pymapreduce-core/)
+[![Version](https://img.shields.io/badge/version-0.1.15-blue.svg?style=flat-square)](https://pypi.org/project/pymapreduce-core/)
 [![Python](https://img.shields.io/badge/python-3.8%2B-brightgreen.svg?style=flat-square)](https://www.python.org/)
 [![Rust](https://img.shields.io/badge/powered%20by-Rust%201.75%2B-orange.svg?style=flat-square)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg?style=flat-square)](LICENSE)
@@ -77,12 +77,16 @@ if __name__ == "__main__":
     - [2.5. Zero-Copy Shared Memory (`ObjectRef`)](#25-zero-copy-shared-memory-objectref)
     - [2.6. Distributed Datasets](#26-distributed-datasets)
     - [2.7. Job Timeouts & Task Cancellation](#27-job-timeouts--task-cancellation)
+    - [2.8. Auto-Scaling Cluster (Warm Standby Pool)](#28-auto-scaling-cluster-warm-standby-pool)
   - [3. Cluster Deployment](#3-cluster-deployment)
     - [3.1. Local Mode (Embedded)](#31-local-mode-embedded)
     - [3.2. Multi-Server Production Cluster](#32-multi-server-production-cluster)
     - [3.3. Docker & Kubernetes Deployment](#33-docker--kubernetes-deployment)
+    - [3.4. Auto-Scaling Production Cluster](#34-auto-scaling-production-cluster)
   - [4. Task Scheduling Strategies](#4-task-scheduling-strategies)
   - [5. Command Line Interface (CLI)](#5-command-line-interface-cli)
+    - [5.1. Starting Cluster Nodes (`mapreduce start`)](#51-starting-cluster-nodes-mapreduce-start)
+    - [5.2. Submitting Standalone Scripts (`mapreduce submit`)](#52-submitting-standalone-scripts-mapreduce-submit)
   - [6. Python API Reference](#6-python-api-reference)
     - [Top-Level Functions](#top-level-functions)
     - [Core Classes & Methods](#core-classes--methods)
@@ -335,6 +339,29 @@ async def main():
 
 ---
 
+### 2.8. Auto-Scaling Cluster (Warm Standby Pool)
+
+PyMapReduce provides native cluster auto-scaling designed specifically for bare-metal multi-server setups without requiring Kubernetes or external orchestrators.
+
+#### The Problem: Load Balancer Cold-Split Conflict
+In traditional distributed engines, adding a standby server causes standard schedulers (RoundRobin, LeastLoad, WeightedCapacity) to immediately split incoming jobs across all connected nodes—preventing any idle standby state.
+
+#### The Solution: Warm Standby Pool
+- **Warm Standby State (`--standby`)**: The standby machine connects to the HeadNode, keeps TCP and heartbeat alive, but maintains **0% CPU usage** and **0 active Python worker processes**.
+- **Scheduler Isolation**: All 5 scheduling strategies (`Adaptive`, `LeastLoad`, `WeightedCapacity`, `LocalityFirst`, `RoundRobin`) completely ignore nodes in `Standby` status during normal execution.
+- **Multi-Layer Scale-Out Guard**:
+  1. *Sustained Congestion Window*: Queue backlog must persist for at least $\ge 5$ seconds (configurable via `--scale-out-delay`) to filter out 200ms micro-bursts.
+  2. *Queue Backlog Depth*: At least $\ge 8$ pending tasks (configurable via `--scale-out-min-tasks`) must be queued.
+  3. *Cooldown Protection*: Minimum $\ge 30$ seconds (configurable via `--scale-out-cooldown`) between successive scale-outs to allow the cluster to stabilize.
+- **Safe Scale-In ("Three-No" Zero Data Loss Filter)**:
+  Before returning a worker to Standby mode, the Watchdog verifies:
+  1. No running tasks remain on the node.
+  2. No alive Stateful Actors reside in the worker's memory.
+  3. No intermediate shuffle objects held by the node are needed as dependencies for active cluster jobs.
+- **Self-Healing Fallback**: If a worker connects with `--standby` to a HeadNode where `--auto-scale` is disabled, the HeadNode automatically adapts it to `Active` to prevent permanent starvation.
+
+---
+
 ## 3. Cluster Deployment
 
 ### 3.1. Local Mode (Embedded)
@@ -395,6 +422,21 @@ services:
       - headnode
 ```
 
+### 3.4. Auto-Scaling Production Cluster
+
+For elastic production setups with physical standby servers:
+
+```bash
+# 1. Master Server (192.168.1.10): Start Head Node with Auto-Scaling Watchdog
+mapreduce start --head --port 7777 --auto-scale --scale-out-delay 5 --scale-out-min-tasks 8 --scale-out-cooldown 30
+
+# 2. Primary Worker Server (192.168.1.20): Starts Active immediately
+mapreduce start --worker --head-addr 192.168.1.10:7777 --cpus 16
+
+# 3. Elastic Standby Server (192.168.1.21): Warm Standby (0% CPU until woke up)
+mapreduce start --worker --head-addr 192.168.1.10:7777 --cpus 16 --standby
+```
+
 ---
 
 ## 4. Task Scheduling Strategies
@@ -452,15 +494,216 @@ Configure how tasks are scheduled across available workers:
 
 ## 5. Command Line Interface (CLI)
 
+PyMapReduce provides the `mapreduce` command-line tool with two primary commands: `mapreduce start` (for launching cluster nodes) and `mapreduce submit` (for submitting standalone Python scripts to the cluster).
+
+---
+
+### 5.1. Starting Cluster Nodes (`mapreduce start`)
+
+Used to start either the cluster coordinator (**Head Node**) or a compute worker (**Worker Node**).
+
 ```bash
-# Start cluster coordinator (HeadNode)
+# General Syntax
+mapreduce start [--head | --worker] [OPTIONS]
+```
+
+#### Detailed CLI Flags Reference for `mapreduce start`
+
+<table width="100%">
+  <thead>
+    <tr>
+      <th width="24%">Flag & Syntax</th>
+      <th width="14%">Default</th>
+      <th width="16%">Target Node</th>
+      <th width="46%">Purpose & Technical Behavior</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>--head</code></td>
+      <td><code>False</code></td>
+      <td>Head Node</td>
+      <td>
+        <strong>Starts the node as the Cluster Coordinator (Head Node / Master).</strong><br>
+        Listens for network connections, initializes the Global Control Store (GCS), Write-Ahead Log (WAL), multi-tier <code>TaskQueue</code>, schedules tasks across workers, and runs the Auto-Scaling Watchdog loop.
+      </td>
+    </tr>
+    <tr>
+      <td><code>--worker</code></td>
+      <td><code>False</code></td>
+      <td>Worker Node</td>
+      <td>
+        <strong>Starts the node as a Compute Worker (Worker Node).</strong><br>
+        Actively connects to the Head Node, reports hardware capacity (CPUs, RAM), manages a pool of isolated Python worker processes (<code>daemon.py</code>), executes tasks, and stores intermediate objects in <code>/dev/shm</code>.
+      </td>
+    </tr>
+    <tr>
+      <td><code>--head-addr &lt;IP:PORT&gt;</code></td>
+      <td><code>127.0.0.1:7777</code></td>
+      <td>Worker / Submit</td>
+      <td>
+        <strong>IP address and port of the Head Node.</strong><br>
+        Used by Worker Nodes to connect to the cluster coordinator, or by <code>mapreduce submit</code> to dispatch distributed jobs to the master.
+      </td>
+    </tr>
+    <tr>
+      <td><code>--port &lt;PORT&gt;</code></td>
+      <td><code>7777</code></td>
+      <td>Head Node</td>
+      <td>
+        <strong>TCP port for the Head Node to bind and listen on.</strong><br>
+        All Worker Nodes and client Drivers communicate with the Head Node through this port via low-latency framed binary TCP.
+      </td>
+    </tr>
+    <tr>
+      <td><code>--cpus &lt;N&gt;</code></td>
+      <td>All host CPU cores</td>
+      <td>Worker Node</td>
+      <td>
+        <strong>Limits the number of physical CPU cores allocated to the Worker Node.</strong><br>
+        Defaults to all detected physical cores on the host machine (100% CPU utilization). The maximum concurrency capacity is <code>2 x CPUs</code> to prevent idle latency.
+      </td>
+    </tr>
+    <tr>
+      <td><code>--idle-timeout &lt;SECS&gt;</code></td>
+      <td><code>0</code> (Disabled)</td>
+      <td>Worker Node</td>
+      <td>
+        <strong>Idle timeout in seconds before terminating idle Python worker processes.</strong><br>
+        If no tasks are assigned within this duration, idle Python processes are killed to free system memory. <code>0</code> keeps worker processes persistent indefinitely.
+      </td>
+    </tr>
+    <tr>
+      <td><code>--scheduler &lt;NAME&gt;</code></td>
+      <td><code>RoundRobin</code></td>
+      <td>Head Node</td>
+      <td>
+        <strong>Task scheduling strategy used by the Head Node.</strong><br>
+        Supported options:<br>
+        • <code>Adaptive</code>: Dynamically evaluates real-time network bandwidth (EMA), CPU load, and data locality (Recommended for production).<br>
+        • <code>LeastLoad</code>: Prioritizes workers with the lowest number of active tasks.<br>
+        • <code>WeightedCapacity</code>: Weighs worker capacity based on physical CPU cores and RAM size.<br>
+        • <code>LocalityFirst</code>: Prioritizes workers that already hold input object dependencies in local RAM.<br>
+        • <code>RoundRobin</code>: Rotates tasks evenly across all available workers.
+      </td>
+    </tr>
+    <tr>
+      <td><code>--auto-scale</code></td>
+      <td><code>False</code></td>
+      <td>Head Node</td>
+      <td>
+        <strong>Enables cluster elastic auto-scaling on the Head Node.</strong><br>
+        Spawns a periodic 1-second Watchdog loop. When active workers reach full saturation and the task backlog persists, the Watchdog wakes up warm standby workers (<code>--standby</code>) by sending <code>WakeUp</code> messages.<br>
+        <em>Note: Auto-Scaling exclusively serves standard distributed compute tasks (<code>Map</code>/<code>Reduce</code>) and does not scale stateful Actors.</em>
+      </td>
+    </tr>
+    <tr>
+      <td><code>--scale-out-delay &lt;SECS&gt;</code></td>
+      <td><code>5</code></td>
+      <td>Head Node (Auto-Scale)</td>
+      <td>
+        <strong>Sustained queue congestion duration before triggering scale-out (Layer 1).</strong><br>
+        Prevents false alarms from transient micro-bursts (&le; 200ms). Scale-out triggers only if the queue remains continuously congested for at least this many seconds.
+      </td>
+    </tr>
+    <tr>
+      <td><code>--scale-out-min-tasks &lt;N&gt;</code></td>
+      <td><code>8</code></td>
+      <td>Head Node (Auto-Scale)</td>
+      <td>
+        <strong>Minimum queue depth (number of pending tasks) required to scale out (Layer 2).</strong><br>
+        Avoids waking up standby servers for only a few residual tasks that primary workers can quickly finish.
+      </td>
+    </tr>
+    <tr>
+      <td><code>--scale-out-cooldown &lt;SECS&gt;</code></td>
+      <td><code>30</code></td>
+      <td>Head Node (Auto-Scale)</td>
+      <td>
+        <strong>Cooldown period in seconds between successive scale-outs (Layer 3).</strong><br>
+        Prevents cascading scale-out spikes, giving newly awakened workers time to accept tasks and absorb cluster load.
+      </td>
+    </tr>
+    <tr>
+      <td><code>--standby</code></td>
+      <td><code>False</code></td>
+      <td>Worker Node</td>
+      <td>
+        <strong>Starts the worker in Warm Standby Pool mode for auto-scaling.</strong><br>
+        Maintains TCP connectivity and periodic heartbeats with the Head Node while consuming <strong>0% CPU</strong> (no background Python worker processes). Dedicated exclusively to stateless compute (<code>Map</code>/<code>Reduce</code>); stateful Actors are never assigned to standby workers. Ignored by scheduling algorithms until awakened by the Head Node during scale-out.
+      </td>
+    </tr>
+  </tbody>
+</table>
+
+---
+
+### 5.2. Submitting Standalone Scripts (`mapreduce submit`)
+
+Dispatches a standalone Python script containing distributed tasks or actor workflows to the cluster:
+
+```bash
+# General Syntax
+mapreduce submit <script.py> [--head-addr <IP:PORT>] [--max-time <SECONDS>]
+```
+
+#### Detailed CLI Flags Reference for `mapreduce submit`
+
+<table width="100%">
+  <thead>
+    <tr>
+      <th width="26%">Argument / Flag</th>
+      <th width="18%">Default</th>
+      <th width="56%">Purpose & Technical Behavior</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>script</code> <em>(Positional)</em></td>
+      <td><em>Required</em></td>
+      <td>
+        <strong>Path to the Python script to execute.</strong><br>
+        The script utilizes the <code>pymapreduce</code> library to submit distributed functions, actors, or dataset transformations.
+      </td>
+    </tr>
+    <tr>
+      <td><code>--head-addr &lt;IP:PORT&gt;</code></td>
+      <td><code>127.0.0.1:7777</code></td>
+      <td>
+        <strong>IP address and port of the target Head Node coordinator.</strong><br>
+        The client driver connects to this endpoint to submit jobs, monitor real-time execution progress, and collect outputs.
+      </td>
+    </tr>
+    <tr>
+      <td><code>--max-time &lt;SECONDS&gt;</code></td>
+      <td><code>None</code> (Unlimited)</td>
+      <td>
+        <strong>Maximum execution timeout for the entire job in seconds (Watchdog Timeout).</strong><br>
+        If job execution exceeds this limit, the Head Node automatically triggers two-phase cancellation, sending <code>SIGTERM/SIGKILL</code> to kill tasks and reclaim cluster resources.
+      </td>
+    </tr>
+  </tbody>
+</table>
+
+---
+
+### 5.3. CLI Quickstart Examples
+
+```bash
+# 1. Traditional Static Cluster (1 Master, 1 Worker)
 mapreduce start --head --port 7777 --scheduler Adaptive
+mapreduce start --worker --head-addr 127.0.0.1:7777 --cpus 16
 
-# Connect a worker node with 8 CPUs and 300s idle timeout
-mapreduce start --worker --head-addr 127.0.0.1:7777 --cpus 8 --idle-timeout 300
+# 2. Elastic Auto-Scaling Cluster (Warm Standby Pool)
+# Coordinator with Watchdog:
+mapreduce start --head --port 7777 --scheduler Adaptive --auto-scale --scale-out-delay 5 --scale-out-min-tasks 8
+# Primary Worker (Active, accepts tasks immediately):
+mapreduce start --worker --head-addr 127.0.0.1:7777 --cpus 16
+# Secondary Standby Worker (0% CPU, awakens automatically when congested):
+mapreduce start --worker --head-addr 127.0.0.1:7777 --cpus 16 --standby
 
-# Submit a standalone script with a 60-second watchdog timeout
-mapreduce submit pipeline.py --head-addr 127.0.0.1:7777 --max-time 60
+# 3. Submit a distributed pipeline with a 120-second watchdog limit
+mapreduce submit pipeline.py --head-addr 127.0.0.1:7777 --max-time 120
 ```
 
 ---
@@ -490,8 +733,8 @@ mapreduce submit pipeline.py --head-addr 127.0.0.1:7777 --max-time 60
     </tr>
     <tr>
       <td><code>pymapreduce.connect_worker(...)</code></td>
-      <td><code>head_addr, cpus=None, idle_timeout=0</code></td>
-      <td>Launches a background worker connected to the cluster and returns a <code>WorkerHandle</code>.</td>
+      <td><code>head_addr, cpus=None, idle_timeout=0, standby=False</code></td>
+      <td>Launches a background worker connected to the cluster and returns a <code>WorkerHandle</code>. Set <code>standby=True</code> for warm standby auto-scaling.</td>
     </tr>
     <tr>
       <td><code>@pymapreduce.remote(...)</code></td>
@@ -603,6 +846,31 @@ mapreduce submit pipeline.py --head-addr 127.0.0.1:7777 --max-time 60
     </tr>
   </thead>
   <tbody>
+    <tr>
+      <td><code>PYMAPREDUCE_AUTO_SCALE</code></td>
+      <td><code>0</code> / <code>false</code></td>
+      <td>Enables cluster auto-scaling watchdog loop on the Head Node when set to <code>1</code> or <code>true</code>.</td>
+    </tr>
+    <tr>
+      <td><code>PYMAPREDUCE_SCALE_OUT_DELAY</code></td>
+      <td><code>5</code></td>
+      <td>Sustained queue congestion duration (in seconds) required before scale-out triggers.</td>
+    </tr>
+    <tr>
+      <td><code>PYMAPREDUCE_SCALE_OUT_MIN_TASKS</code></td>
+      <td><code>8</code></td>
+      <td>Minimum depth of queued pending tasks required to qualify for scale-out.</td>
+    </tr>
+    <tr>
+      <td><code>PYMAPREDUCE_SCALE_OUT_COOLDOWN</code></td>
+      <td><code>30</code></td>
+      <td>Cooldown window (in seconds) enforced between consecutive scale-out actions.</td>
+    </tr>
+    <tr>
+      <td><code>PYMAPREDUCE_MAX_TIME</code></td>
+      <td><code>None</code></td>
+      <td>Cluster-wide execution timeout in seconds for submitted jobs.</td>
+    </tr>
     <tr>
       <td><code>PYMAPREDUCE_MAX_ACTORS_PER_WORKER</code></td>
       <td><code>32</code></td>

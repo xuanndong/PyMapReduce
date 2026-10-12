@@ -64,26 +64,50 @@ impl HealthMonitor {
         dead_workers
     }
 
-    /// Resets running/pending tasks assigned to the dead worker so they can be rescheduled.
+    /// Resets running/pending tasks assigned to the dead worker so they can be rescheduled,
+    /// or fails them immediately if their parent actor is Dead.
     fn recover_assigned_tasks(
         state: &mut GcsState,
         worker_id: WorkerId,
         dead_jobs: &HashSet<JobId>,
-    ) -> Vec<Task> {
-        state
-            .active_tasks
-            .values_mut()
-            .filter(|rec| {
-                rec.assigned_to == Some(worker_id)
-                    && matches!(rec.status, TaskStatus::Running | TaskStatus::Pending)
-                    && !dead_jobs.contains(&rec.task.job_id)
-            })
-            .map(|rec| {
-                rec.assigned_to = None;
-                rec.status = TaskStatus::Pending;
-                rec.task.clone()
-            })
-            .collect()
+    ) -> (Vec<Task>, Vec<Task>) {
+        let mut requeue = Vec::new();
+        let mut failed = Vec::new();
+
+        for rec in state.active_tasks.values_mut() {
+            if rec.assigned_to != Some(worker_id)
+                || !matches!(rec.status, TaskStatus::Running | TaskStatus::Pending)
+                || dead_jobs.contains(&rec.task.job_id)
+            {
+                continue;
+            }
+
+            match &rec.task.kind {
+                TaskKind::ActorTask { actor_id, .. } | TaskKind::ActorDestruction { actor_id } => {
+                    let is_dead = state
+                        .actors
+                        .get(actor_id)
+                        .map_or(true, |a| matches!(a.status, ActorStatus::Dead(_)));
+
+                    if is_dead {
+                        rec.status = TaskStatus::Failed("Actor Dead (Worker crashed)".to_string());
+                        rec.assigned_to = None;
+                        failed.push(rec.task.clone());
+                    } else {
+                        rec.assigned_to = None;
+                        rec.status = TaskStatus::Pending;
+                        requeue.push(rec.task.clone());
+                    }
+                }
+                _ => {
+                    rec.assigned_to = None;
+                    rec.status = TaskStatus::Pending;
+                    requeue.push(rec.task.clone());
+                }
+            }
+        }
+
+        (requeue, failed)
     }
 
     /// Evicts objects lost when the worker died and requeues completed tasks for lineage recomputation.
@@ -129,7 +153,7 @@ impl HealthMonitor {
         worker_id: WorkerId,
         dispatcher: &Dispatcher,
     ) -> (Vec<Task>, Vec<Task>) {
-        let has_other_workers = !state.nodes.is_empty();
+        let has_other_workers = state.nodes.values().any(|n| !n.is_elastic);
         let mut dead_actors = Vec::new();
         let mut recreation_tasks = Vec::new();
 
@@ -187,9 +211,9 @@ impl HealthMonitor {
     /// Notifies driver connections for actor tasks that cannot be recovered.
     async fn notify_failed_actor_tasks(&self, failed_tasks: &[Task]) {
         for task in failed_tasks {
-            if let Some(driver_tx) = self.driver_connections.get(&task.job_id) {
+            let tx_opt = self.driver_connections.get(&task.job_id).map(|r| r.value().clone());
+            if let Some(driver_tx) = tx_opt {
                 let _ = driver_tx
-                    .value()
                     .send(Message::TaskFailure {
                         task_id: task.id,
                         job_id: task.job_id,
@@ -217,12 +241,16 @@ impl HealthMonitor {
                 .map(|(id, _)| *id)
                 .collect();
 
-            let mut requeue = Self::recover_assigned_tasks(&mut state, worker_id, &dead_jobs);
-            requeue.extend(Self::recover_lost_lineage(&mut state, worker_id, &dead_jobs));
-
-            let (recreation_tasks, failed_actor_tasks) =
+            let (recreation_tasks, mut failed_actor_tasks) =
                 Self::recover_actors(&mut state, worker_id, &self.dispatcher);
+
+            let (assigned_requeue, assigned_failed) =
+                Self::recover_assigned_tasks(&mut state, worker_id, &dead_jobs);
+
+            let mut requeue = assigned_requeue;
+            requeue.extend(Self::recover_lost_lineage(&mut state, worker_id, &dead_jobs));
             requeue.extend(recreation_tasks);
+            failed_actor_tasks.extend(assigned_failed);
 
             (requeue, failed_actor_tasks)
         };
@@ -235,11 +263,13 @@ impl HealthMonitor {
     }
 
     /// Scans worker heartbeats and initiates recovery for any unresponsive workers.
-    pub async fn scan_and_recover(&mut self) {
+    pub async fn scan_and_recover(&mut self) -> usize {
         let dead_workers = self.detect_dead_workers();
+        let count = dead_workers.len();
         for worker_id in dead_workers {
             self.remove_dead_worker(worker_id).await;
         }
+        count
     }
 }
 
@@ -285,6 +315,8 @@ mod tests {
                         total_ram_mb: 1024,
                     },
                     addr: "".to_string(),
+                    status: crate::types::node::NodeStatus::Active,
+                    is_elastic: false,
                 },
             );
             state.active_tasks.insert(
@@ -313,6 +345,8 @@ mod tests {
                     total_ram_mb: 1024,
                 },
                 addr: "".to_string(),
+                status: crate::types::node::NodeStatus::Active,
+                is_elastic: false,
             },
             &state,
         );

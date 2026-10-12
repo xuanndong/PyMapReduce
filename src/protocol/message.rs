@@ -16,13 +16,16 @@ pub enum TaskReconcileStatus {
         output: TaskOutput,
         object_id: Option<ObjectId>,
     },
-    Failed(String),
+    Failed {
+        job_id: JobId,
+        error: String,
+    },
     NotFound,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Message {
-    // ── Driver ↔ HeadNode ─────────────────────────────────────
+    // Driver <-> HeadNode
     SubmitJob {
         job_id: JobId,
         tasks: Vec<EncodedTask>,
@@ -73,7 +76,7 @@ pub enum Message {
         offset: u64,
     },
 
-    // ── HeadNode ↔ WorkerNode ──────────────────────────────────
+    // HeadNode <-> WorkerNode
     AssignTask {
         task: Box<Task>,
     },
@@ -96,12 +99,21 @@ pub enum Message {
         object_id: ObjectId,
     },
     WakeUp,
+    EnterStandby,
+    WorkerEnteringStandby {
+        worker_id: WorkerId,
+    },
+    RegisterAck {
+        auto_scale_enabled: bool,
+    },
 
     ReportReady {
         worker_id: WorkerId,
         cache_hint: Option<String>,
         capacity: NodeCapacity,
         listener_addr: Option<String>,
+        #[serde(default)]
+        standby: bool,
     },
     TaskSuccess {
         task_id: TaskId,
@@ -123,7 +135,7 @@ pub enum Message {
         worker_id: WorkerId,
     },
 
-    // ── Shared ────────────────────────────────────────────────
+    // Shared
     Pong,
     Error {
         code: u32,

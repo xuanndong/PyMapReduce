@@ -435,7 +435,30 @@ impl Driver {
         let wal = WriteAheadLog::new(std::path::PathBuf::from("/tmp/wal.log")).await?;
         let addr = address.unwrap_or_else(|| "127.0.0.1:7777".to_string());
 
-        let head = HeadNode::new(gcs.clone(), dispatcher.clone(), wal, addr);
+        let auto_scale = std::env::var("PYMAPREDUCE_AUTO_SCALE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let scale_out_delay = std::env::var("PYMAPREDUCE_SCALE_OUT_DELAY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5);
+        let scale_out_min_tasks = std::env::var("PYMAPREDUCE_SCALE_OUT_MIN_TASKS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8);
+        let scale_out_cooldown = std::env::var("PYMAPREDUCE_SCALE_OUT_COOLDOWN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30);
+
+        let config = crate::cluster::head::HeadNodeConfig {
+            auto_scale,
+            scale_out_delay_secs: scale_out_delay,
+            scale_out_min_tasks,
+            scale_out_cooldown_secs: scale_out_cooldown,
+        };
+
+        let head = HeadNode::new_with_config(gcs.clone(), dispatcher.clone(), wal, addr, config);
 
         tokio::spawn(async move {
             let _ = head.run().await;

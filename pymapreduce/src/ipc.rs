@@ -31,7 +31,8 @@ impl IpcWorker {
         cmd.arg("-m").arg("pymapreduce.daemon")
            .stdin(Stdio::piped())
            .stdout(Stdio::piped())
-           .stderr(Stdio::inherit());
+           .stderr(Stdio::inherit())
+           .kill_on_drop(true);
            
         if let Some(id) = env_id {
             let shm_base = std::path::Path::new("/dev/shm");
@@ -112,3 +113,13 @@ impl IpcWorker {
         }
     }
 }
+
+impl Drop for IpcWorker {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            let _ = self.kill_group(libc::SIGKILL);
+        }
+    }
+}
+

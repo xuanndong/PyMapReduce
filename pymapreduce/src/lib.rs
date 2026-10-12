@@ -408,22 +408,34 @@ pub struct PythonExecutor {
 impl PythonExecutor {
     pub fn new(max_cpus: usize, idle_timeout_secs: u64) -> Self {
         let workers: Arc<DashMap<usize, Arc<WorkerState>>> = Arc::new(DashMap::new());
-        let actor_to_worker = Arc::new(DashMap::new());
+        let actor_to_worker: Arc<DashMap<uuid::Uuid, usize>> = Arc::new(DashMap::new());
         let actor_metadata = Arc::new(DashMap::new());
         let running_task_worker = Arc::new(DashMap::new());
         
         if idle_timeout_secs > 0 {
             let workers_clone = workers.clone();
+            let actor_to_worker_clone = actor_to_worker.clone();
             tokio::spawn(async move {
                 let timeout = std::time::Duration::from_secs(idle_timeout_secs);
                 let check_interval = std::time::Duration::from_secs(idle_timeout_secs.min(10).max(1));
                 loop {
                     sleep(check_interval).await;
                     let now = Instant::now();
-                    let mut to_remove = Vec::new();
                     
-                    for entry in workers_clone.iter() {
-                        let state = entry.value();
+                    // Snapshot workers to drop DashMap read lock before any await
+                    let active_workers: Vec<Arc<WorkerState>> = workers_clone
+                        .iter()
+                        .map(|e| e.value().clone())
+                        .collect();
+
+                    let mut to_remove = Vec::new();
+                    for state in active_workers {
+                        // Protect stateful actors: never kill worker process hosting an active Actor
+                        let hosts_actor = actor_to_worker_clone.iter().any(|e| *e.value() == state.id);
+                        if hosts_actor {
+                            continue;
+                        }
+
                         if let Ok(_lock) = state.worker.try_lock() {
                             let last = *state.last_used.lock().await;
                             if now.duration_since(last) > timeout {
@@ -620,6 +632,7 @@ impl Executor for PythonExecutor {
                     ).await;
                     if wait_res.is_err() {
                         let _ = worker_lock.kill_group(libc::SIGKILL);
+                        let _ = worker_lock.child.wait().await;
                     }
                 }
                 #[cfg(not(unix))]
@@ -687,8 +700,8 @@ impl PythonExecutor {
 }
 
 #[pyfunction]
-#[pyo3(signature = (head_addr, workers=None, idle_timeout=0))]
-fn start_worker<'py>(py: Python<'py>, head_addr: String, workers: Option<usize>, idle_timeout: u64) -> PyResult<&'py PyAny> {
+#[pyo3(signature = (head_addr, workers=None, idle_timeout=0, standby=false))]
+fn start_worker<'py>(py: Python<'py>, head_addr: String, workers: Option<usize>, idle_timeout: u64, standby: bool) -> PyResult<&'py PyAny> {
     pyo3_asyncio::tokio::future_into_py(py, async move {
         use mapreduce::cluster::worker::WorkerNode;
         use mapreduce::types::node::NodeCapacity;
@@ -700,7 +713,7 @@ fn start_worker<'py>(py: Python<'py>, head_addr: String, workers: Option<usize>,
         };
         
         let executor = Arc::new(PythonExecutor::new(cpus, idle_timeout));
-        let worker = WorkerNode::new(capacity, executor, head_addr);
+        let worker = WorkerNode::new(capacity, executor, head_addr).with_standby(standby);
         
         match worker.run().await {
             Ok(_) => Ok(()),
@@ -721,8 +734,8 @@ fn start_worker<'py>(py: Python<'py>, head_addr: String, workers: Option<usize>,
 }
 
 #[pyfunction]
-#[pyo3(signature = (head_addr, cpus=None, idle_timeout=0))]
-fn connect_worker<'py>(py: Python<'py>, head_addr: String, cpus: Option<usize>, idle_timeout: u64) -> PyResult<&'py PyAny> {
+#[pyo3(signature = (head_addr, cpus=None, idle_timeout=0, standby=false))]
+fn connect_worker<'py>(py: Python<'py>, head_addr: String, cpus: Option<usize>, idle_timeout: u64, standby: bool) -> PyResult<&'py PyAny> {
     pyo3_asyncio::tokio::future_into_py(py, async move {
         use mapreduce::cluster::worker::WorkerNode;
         use mapreduce::types::node::NodeCapacity;
@@ -734,7 +747,7 @@ fn connect_worker<'py>(py: Python<'py>, head_addr: String, cpus: Option<usize>, 
         };
 
         let executor = Arc::new(PythonExecutor::new(actual_cpus, idle_timeout));
-        let worker = Arc::new(WorkerNode::new(capacity, executor, head_addr));
+        let worker = Arc::new(WorkerNode::new(capacity, executor, head_addr).with_standby(standby));
         let worker_clone = worker.clone();
 
         tokio::spawn(async move {
