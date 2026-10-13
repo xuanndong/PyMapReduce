@@ -97,7 +97,7 @@ impl WorkerSession {
             }
             Message::WakeUp => {
                 self.worker.is_standby.store(false, Ordering::Relaxed);
-                println!("[Worker {}] Woken up from standby by HeadNode!", self.worker.id);
+                println!("[Worker {}] Woken up as active by HeadNode!", self.worker.id);
             }
             Message::EnterStandby => {
                 self.worker.is_standby.store(true, Ordering::Relaxed);
@@ -121,6 +121,11 @@ impl WorkerSession {
 
     async fn handle_assign_task(&self, task: Box<Task>) {
         if self.worker.is_draining.load(Ordering::Relaxed) {
+            return;
+        }
+
+        // Avoid duplicate execution if task is already running on this worker
+        if self.worker.running_tasks.contains_key(&task.id) {
             return;
         }
 
@@ -475,6 +480,8 @@ impl WorkerNode {
 
         while should_reconnect {
             tokio::select! {
+                biased;
+
                 ctrl = control_rx.recv() => {
                     match ctrl {
                         Some(WorkerControl::Disconnect { graceful }) => {
@@ -491,17 +498,17 @@ impl WorkerNode {
                         }
                     }
                 }
+                Some(msg) = rx.recv() => {
+                    if framed.send(msg).await.is_err() {
+                        break;
+                    }
+                }
                 msg = framed.next() => {
                     let Some(msg_result) = msg else { break; };
                     let Ok(message) = msg_result else { break; };
 
                     if session.handle_incoming_message(message).await.is_break() {
                         should_reconnect = false;
-                        break;
-                    }
-                }
-                Some(msg) = rx.recv() => {
-                    if framed.send(msg).await.is_err() {
                         break;
                     }
                 }

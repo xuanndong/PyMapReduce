@@ -690,10 +690,6 @@ impl PythonExecutor {
                 continue;
             }
             
-            if let Some(state) = self.workers.iter().find(|e| e.value().env_id == env_id).map(|e| e.value().clone()) {
-                return Ok(state);
-            }
-            
             sleep(Duration::from_millis(50)).await;
         }
     }

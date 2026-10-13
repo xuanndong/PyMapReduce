@@ -47,17 +47,33 @@ impl HealthMonitor {
     /// Identifies and returns worker IDs whose heartbeat has timed out beyond snooze threshold.
     fn detect_dead_workers(&mut self) -> Vec<WorkerId> {
         let now = Instant::now();
-        let timeout = Duration::from_secs(HEARTBEAT_TIMEOUT_SECS);
+        let timeout_secs = std::env::var("PYMAPREDUCE_HEARTBEAT_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(HEARTBEAT_TIMEOUT_SECS);
+        let base_timeout = Duration::from_secs(timeout_secs);
         let mut dead_workers = Vec::new();
 
+        let state = self.gcs.read();
         for (&worker_id, &last_seen) in &self.last_heartbeat {
-            if now.duration_since(last_seen) > timeout {
+            // Task-aware grace period: if worker is actively processing tasks, extend the timeout
+            // to avoid false-positive failure detection caused by CPU starvation.
+            let has_tasks = state.worker_load.get(&worker_id).copied().unwrap_or(0) > 0;
+            let effective_timeout = if has_tasks {
+                base_timeout * 2
+            } else {
+                base_timeout
+            };
+
+            if now.duration_since(last_seen) > effective_timeout {
                 let snooze = self.snooze_counts.entry(worker_id).or_insert(0);
                 if *snooze < MAX_SNOOZE_COUNT {
                     *snooze += 1;
                 } else {
                     dead_workers.push(worker_id);
                 }
+            } else {
+                self.snooze_counts.insert(worker_id, 0);
             }
         }
 
@@ -270,6 +286,15 @@ impl HealthMonitor {
             self.remove_dead_worker(worker_id).await;
         }
         count
+    }
+
+    /// Scans worker heartbeats, initiates recovery, and returns the dead worker IDs.
+    pub async fn scan_and_recover_dead(&mut self) -> Vec<WorkerId> {
+        let dead_workers = self.detect_dead_workers();
+        for &worker_id in &dead_workers {
+            self.remove_dead_worker(worker_id).await;
+        }
+        dead_workers
     }
 }
 

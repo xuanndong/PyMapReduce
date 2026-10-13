@@ -1455,9 +1455,17 @@ impl HeadNode {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
             loop {
                 interval.tick().await;
-                let mut monitor = health_monitor.lock().await;
-                let dead_count = monitor.scan_and_recover().await;
-                if dead_count > 0 {
+                let dead_workers = {
+                    let mut monitor = health_monitor.lock().await;
+                    monitor.scan_and_recover_dead().await
+                };
+                if !dead_workers.is_empty() {
+                    for w_id in &dead_workers {
+                        if let Some((_, tx)) = ctx_monitor.worker_connections.remove(w_id) {
+                            let _ = tx.send(Message::Shutdown).await;
+                        }
+                        ctx_monitor.elastic_workers.remove(w_id);
+                    }
                     ctx_monitor.dispatch_all_active_workers().await;
                 }
             }

@@ -2,7 +2,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/version-0.1.15-blue.svg?style=flat-square)](https://pypi.org/project/pymapreduce-core/)
+[![Version](https://img.shields.io/badge/version-0.1.16-blue.svg?style=flat-square)](https://pypi.org/project/pymapreduce-core/)
 [![Python](https://img.shields.io/badge/python-3.8%2B-brightgreen.svg?style=flat-square)](https://www.python.org/)
 [![Rust](https://img.shields.io/badge/powered%20by-Rust%201.75%2B-orange.svg?style=flat-square)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg?style=flat-square)](LICENSE)
