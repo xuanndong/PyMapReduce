@@ -57,7 +57,7 @@ maturin develop --release
 
 > [!IMPORTANT]
 > **Worker Dependencies Notice:**
-> Tasks and actors executed via `@pymapreduce.remote` run within the local Python environment of the assigned Worker nodes. Therefore, **all third-party Python packages required by your workload must be installed on every Worker node**.
+> Tasks and actors executed via `@pymapreduce.remote` run within the local Python environment of the assigned Worker nodes. Therefore, all third-party Python packages required by your workload must be installed on every Worker node.
 > 
 > - *Example (Machine Learning):* If your remote tasks use Scikit-learn (e.g. `from sklearn.ensemble import RandomForestClassifier`), you must run `pip install scikit-learn` in the Python environment of every worker machine.
 > - *Example (Data Processing / PyTorch):* Ensure packages like `pandas`, `numpy`, or `torch` are similarly installed on all workers.
@@ -67,7 +67,7 @@ maturin develop --release
 
 ## 2. Quickstart
 
-PyMapReduce provides two execution primitives—**Stateless Tasks** and **Stateful Actors**—along with a **Distributed Dataset** API for larger data workloads.
+PyMapReduce provides two execution primitives — Stateless Tasks and Stateful Actors — along with a Distributed Dataset API for larger data workloads.
 
 ### 2.1. Stateless Tasks
 
@@ -98,7 +98,7 @@ if __name__ == "__main__":
 
 ### 2.2. Stateful Actors
 
-Decorating a Python class with `@pymapreduce.remote` turns it into a **Stateful Actor**. The actor instance resides on a dedicated worker, maintaining its internal state across invocations. Subsequent method calls are routed in FIFO order to that worker:
+Decorating a Python class with `@pymapreduce.remote` turns it into a Stateful Actor. The actor instance resides on a dedicated worker, maintaining its internal state across invocations. Subsequent method calls are routed in FIFO order to that worker:
 
 ```python
 import asyncio
