@@ -20,7 +20,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.12'
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -28,12 +28,12 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@v1
         with:
-          zig-version: 0.13.0
+          version: 0.13.0
 
       - name: Install build tools
         run: |
           pip install --upgrade pip
-          pip install maturin cloudpickle
+          pip install maturin==1.14.1 ziglang==0.16.0 cloudpickle==3.1.2
 
       - name: Build wheels and sdist
         working-directory: pymapreduce
