@@ -15,7 +15,7 @@ services:
       - pymapreduce_wal:/tmp
     command: >
       sh -c "
-      pip install --no-cache-dir pymapreduce-core==0.1.14 &&
+      pip install --no-cache-dir pymapreduce-core &&
       mapreduce start --head --port 7777 --scheduler $${SCHEDULER:-Adaptive} 2>&1 | grep --line-buffered -v -E 'Disaster Recovery|WAL|wal'
       "
     logging:
