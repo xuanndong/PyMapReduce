@@ -2,7 +2,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/version-0.1.17-blue.svg?style=flat-square)](https://pypi.org/project/pymapreduce-core/)
+[![Version](https://img.shields.io/badge/version-0.1.18-blue.svg?style=flat-square)](https://pypi.org/project/pymapreduce-core/)
 [![Python](https://img.shields.io/badge/python-3.8%2B-brightgreen.svg?style=flat-square)](https://www.python.org/)
 [![Rust](https://img.shields.io/badge/powered%20by-Rust%201.75%2B-orange.svg?style=flat-square)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg?style=flat-square)](LICENSE)
@@ -297,8 +297,8 @@ async def main():
     driver = await pymapreduce.init()
     await pymapreduce.connect_worker("127.0.0.1:7777", cpus=4)
 
-    # 1. Create dataset from items, CSV, or Pandas
-    ds = await pymapreduce.from_items(range(1, 100_001), num_partitions=8)
+    # 1. Create dataset from sequence, CSV, DataFrame, or array
+    ds = await pymapreduce.from_sequence(range(1, 100_001), num_partitions=8)
 
     # 2. Lazy transformation pipeline
     transformed = await (
@@ -747,24 +747,24 @@ mapreduce submit pipeline.py --head-addr 127.0.0.1:7777 --max-time 120
       <td>Asynchronously purges an actor instance from worker memory and cluster registry.</td>
     </tr>
     <tr>
-      <td><code>pymapreduce.from_items(...)</code></td>
-      <td><code>items, num_partitions=None</code></td>
-      <td>Creates a distributed <code>Dataset</code> from in-memory sequences.</td>
+      <td><code>pymapreduce.from_sequence(...)</code></td>
+      <td><code>seq, num_partitions=None, batch_size=None</code></td>
+      <td>Creates a distributed <code>Dataset</code> from in-memory sequences or Python iterables.</td>
+    </tr>
+    <tr>
+      <td><code>pymapreduce.from_dataframe(...)</code></td>
+      <td><code>df, num_partitions=None, batch_size=None</code></td>
+      <td>Creates a distributed <code>Dataset</code> from any tabular DataFrame (Pandas, Polars, PyArrow Table).</td>
+    </tr>
+    <tr>
+      <td><code>pymapreduce.from_array(...)</code></td>
+      <td><code>arr, num_partitions=None</code></td>
+      <td>Creates a distributed <code>Dataset</code> from contiguous arrays, tensors, or sequences (NumPy, PyTorch, JAX, CuPy).</td>
     </tr>
     <tr>
       <td><code>pymapreduce.read_csv(...)</code></td>
       <td><code>path_or_glob, num_partitions=None</code></td>
       <td>Creates a distributed <code>Dataset</code> by chunking CSV files.</td>
-    </tr>
-    <tr>
-      <td><code>pymapreduce.from_pandas(...)</code></td>
-      <td><code>df, num_partitions=None</code></td>
-      <td>Creates a distributed <code>Dataset</code> from a Pandas DataFrame.</td>
-    </tr>
-    <tr>
-      <td><code>pymapreduce.from_numpy(...)</code></td>
-      <td><code>arr, num_partitions=None</code></td>
-      <td>Creates a distributed <code>Dataset</code> from a NumPy array.</td>
     </tr>
   </tbody>
 </table>

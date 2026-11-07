@@ -244,7 +244,11 @@ impl ObjectStore {
             .await
             .map_err(FrameworkError::Io)?;
         let path = self.shm_dir.join(id.to_string());
-        tokio::fs::write(path, data)
+        let tmp_path = self.shm_dir.join(format!(".{}.tmp", id));
+        tokio::fs::write(&tmp_path, data)
+            .await
+            .map_err(FrameworkError::Io)?;
+        tokio::fs::rename(&tmp_path, &path)
             .await
             .map_err(FrameworkError::Io)?;
         Ok(())

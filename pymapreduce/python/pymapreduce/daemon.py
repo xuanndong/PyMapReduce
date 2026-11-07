@@ -215,7 +215,7 @@ def _resolve_args(obj, py_deps):
 
     if isinstance(obj, tuple):
         # Handle serialized ObjectRef tuple: ("__ObjectRef__", "uuid")
-        if len(obj) == 2 and obj[0] == "__ObjectRef__":
+        if len(obj) == 2 and isinstance(obj[0], str) and obj[0] == "__ObjectRef__":
             return py_deps.get(obj[1], obj)
         return tuple(_resolve_args(x, py_deps) for x in obj)
 

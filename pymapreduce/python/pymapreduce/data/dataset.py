@@ -6,7 +6,7 @@ import asyncio
 import os
 import uuid
 from enum import Enum
-from typing import Any, Callable, Iterable, List, Optional, Sequence, Union
+from typing import Any, Callable, List, Optional, Sequence
 
 try:
     import cloudpickle as pickle
@@ -184,7 +184,7 @@ class Dataset:
 
         # Collect raw items and redistribute
         items = await self.collect()
-        return await Dataset.from_items(items, num_partitions=num_partitions)
+        return await Dataset.from_sequence(items, num_partitions=num_partitions)
 
     def persist(self, level: StorageLevel = StorageLevel.MEMORY_ONLY) -> Dataset:
         """Mark dataset blocks to be kept in cluster memory and pinned from GC."""
@@ -326,23 +326,23 @@ class Dataset:
         return cls(blocks)
 
     @classmethod
-    async def from_items(
+    async def from_sequence(
         cls,
-        items: Sequence[Any],
+        seq: Sequence[Any],
         num_partitions: Optional[int] = None,
         batch_size: Optional[int] = None,
     ) -> Dataset:
-        """Create a Dataset by partitioning an in-memory sequence of Python items."""
-        total_items = len(items)
+        """Create a distributed Dataset by partitioning an in-memory sequence or iterable."""
+        total_items = len(seq)
         if total_items == 0:
             return cls([])
 
         if batch_size is not None and batch_size > 0:
-            partitions = [items[i : i + batch_size] for i in range(0, total_items, batch_size)]
+            partitions = [seq[i : i + batch_size] for i in range(0, total_items, batch_size)]
         else:
             k = num_partitions or max(1, os.cpu_count() or 4)
             chunk_size = max(1, (total_items + k - 1) // k)
-            partitions = [items[i : i + chunk_size] for i in range(0, total_items, chunk_size)]
+            partitions = [seq[i : i + chunk_size] for i in range(0, total_items, chunk_size)]
 
         driver = getattr(pymapreduce, "_global_driver", None)
         if driver is None:
@@ -358,13 +358,13 @@ class Dataset:
         return cls(blocks)
 
     @classmethod
-    async def from_pandas(
+    async def from_dataframe(
         cls,
         df: Any,
         num_partitions: Optional[int] = None,
         batch_size: Optional[int] = None,
     ) -> Dataset:
-        """Create a Dataset by partitioning a pandas DataFrame across the cluster."""
+        """Create a distributed Dataset by partitioning a tabular DataFrame (Pandas, Polars, PyArrow, etc.) across the cluster."""
         total_rows = len(df)
         if total_rows == 0:
             return cls([])
@@ -386,7 +386,13 @@ class Dataset:
             # Try serializing as PyArrow IPC for zero-copy if pyarrow is installed
             try:
                 import pyarrow as pa
-                table = pa.Table.from_pandas(chunk)
+                if isinstance(chunk, pa.Table):
+                    table = chunk
+                elif hasattr(chunk, "__dataframe__"):
+                    import pyarrow.interchange as pai
+                    table = pai.from_dataframe(chunk)
+                else:
+                    table = pa.Table.from_pandas(chunk)
                 sink = pa.BufferOutputStream()
                 with pa.ipc.new_stream(sink, table.schema) as writer:
                     writer.write_table(table)
@@ -400,12 +406,12 @@ class Dataset:
         return cls(blocks)
 
     @classmethod
-    async def from_numpy(
+    async def from_array(
         cls,
         arr: Any,
         num_partitions: Optional[int] = None,
     ) -> Dataset:
-        """Create a Dataset by partitioning a NumPy array."""
+        """Create a distributed Dataset by partitioning an array, tensor, or contiguous multi-dimensional sequence."""
         total_len = len(arr)
         if total_len == 0:
             return cls([])
@@ -482,14 +488,14 @@ class Dataset:
 def from_blocks(blocks: Sequence[pymapreduce.ObjectRef]) -> Dataset:
     return Dataset.from_blocks(blocks)
 
-async def from_items(items: Sequence[Any], num_partitions: Optional[int] = None) -> Dataset:
-    return await Dataset.from_items(items, num_partitions=num_partitions)
+async def from_sequence(seq: Sequence[Any], num_partitions: Optional[int] = None) -> Dataset:
+    return await Dataset.from_sequence(seq, num_partitions=num_partitions)
 
-async def from_pandas(df: Any, num_partitions: Optional[int] = None) -> Dataset:
-    return await Dataset.from_pandas(df, num_partitions=num_partitions)
+async def from_dataframe(df: Any, num_partitions: Optional[int] = None) -> Dataset:
+    return await Dataset.from_dataframe(df, num_partitions=num_partitions)
 
-async def from_numpy(arr: Any, num_partitions: Optional[int] = None) -> Dataset:
-    return await Dataset.from_numpy(arr, num_partitions=num_partitions)
+async def from_array(arr: Any, num_partitions: Optional[int] = None) -> Dataset:
+    return await Dataset.from_array(arr, num_partitions=num_partitions)
 
 async def read_csv(path_or_glob: str, num_partitions: Optional[int] = None) -> Dataset:
     return await Dataset.read_csv(path_or_glob, num_partitions=num_partitions)

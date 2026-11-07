@@ -136,28 +136,31 @@ if __name__ == "__main__":
 
 ### 2.3. Distributed Datasets
 
-The Dataset API reads partitioned files in blocks and supports chained distributed transformations:
+The Dataset API provides lazy, functional transformations for parallel data processing across tabular DataFrames, multi-dimensional arrays/tensors, and files:
 
 ```python
 import asyncio
+import pandas as pd
 import pymapreduce
-from pymapreduce.data import read_csv
 
 async def run_data_pipeline():
     driver = await pymapreduce.init()
     await pymapreduce.connect_worker("127.0.0.1:7777", cpus=8)
 
-    # Read data split into 64 MB blocks
-    dataset = read_csv("dataset/*.csv", block_size_mb=64)
+    # 1. Create distributed dataset from DataFrame (Pandas, Polars, PyArrow Table)
+    df = pd.DataFrame({"id": range(100_000), "price": [10.5] * 100_000, "qty": [2] * 100_000, "status": ["CONFIRMED"] * 100_000})
+    dataset = await pymapreduce.from_dataframe(df, num_partitions=8)
+    
+    # Or create from Array/Tensor: await pymapreduce.from_array(arr, num_partitions=8)
+    # Or create from CSV files:    await pymapreduce.read_csv("dataset/*.csv")
 
-    # Distributed filter, map, and repartition pipeline
+    # 2. Distributed filter, map, and repartition pipeline
     result_df = await (
-        dataset.filter(lambda df: df["status"] == "CONFIRMED")
-               .map_batches(lambda df: df.assign(total=df["price"] * df["qty"]), batch_format="pandas")
-               .repartition(num_blocks=8)
-               .to_pandas()
-    )
-    print(result_df.describe())
+        (await dataset.filter(lambda row: row.get("status") == "CONFIRMED" if isinstance(row, dict) else True))
+               .map_batches(lambda batch: batch.assign(total=batch["price"] * batch["qty"]), batch_format="pandas")
+    ).repartition(num_partitions=16)
+
+    print("Transformed dataset ready with partitions:", result_df.num_partitions)
 
 if __name__ == "__main__":
     asyncio.run(run_data_pipeline())
