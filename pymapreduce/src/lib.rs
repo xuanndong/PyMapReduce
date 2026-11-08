@@ -197,12 +197,28 @@ impl Driver {
                 .await
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
                 
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            
             let connect_addr = addr_clone.unwrap_or_else(|| "127.0.0.1:7777".to_string());
-            let driver = CoreDriver::connect(&connect_addr, None)
-                .await
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            let mut last_err = None;
+            let mut connected_driver = None;
+            for _ in 0..25 {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                match CoreDriver::connect(&connect_addr, None).await {
+                    Ok(driver) => {
+                        connected_driver = Some(driver);
+                        break;
+                    }
+                    Err(e) => {
+                        last_err = Some(e);
+                    }
+                }
+            }
+
+            let driver = match connected_driver {
+                Some(d) => d,
+                None => return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    last_err.map(|e| e.to_string()).unwrap_or_else(|| "Failed to connect to cluster".to_string())
+                )),
+            };
                 
             let driver_wrapper = Driver {
                 inner: Arc::new(driver),

@@ -326,6 +326,7 @@ impl DriverActor {
         for delay in BACKOFFS {
             tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
             if let Ok(new_stream) = TcpStream::connect(&self.head_addr).await {
+                let _ = new_stream.set_nodelay(true);
                 self.framed = Framed::new(new_stream, MessageCodec::new());
                 reconnected = true;
                 break;
@@ -367,6 +368,7 @@ impl Driver {
         let stream = TcpStream::connect(head_node)
             .await
             .map_err(|e| FrameworkError::Network(e.to_string()))?;
+        let _ = stream.set_nodelay(true);
 
         let (tx, rx) = mpsc::channel::<DriverCommand>(100);
         let actor = DriverActor::new(stream, rx, tx.clone(), head_node.to_string());

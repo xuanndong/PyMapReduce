@@ -1289,125 +1289,150 @@ impl HeadNode {
 
         println!("[Disaster Recovery] Recovering GCS state from {} WAL records...", messages.len());
 
-        let mut state = self.gcs.write();
+        let mut objects_to_restore = Vec::new();
+        let mut objects_to_delete = Vec::new();
 
-        for msg in messages {
-            match msg {
-                Message::SubmitJob { job_id, tasks, .. } => {
-                    let mut task_ids = Vec::new();
-                    for task_bytes in tasks {
-                        if let Ok(task) = bincode::deserialize::<Task>(&task_bytes) {
-                            task_ids.push(task.id);
-                            if let TaskKind::ActorCreation { actor_id, class_name } = &task.kind {
-                                state.actors.insert(
-                                    *actor_id,
-                                    ActorRecord {
-                                        actor_id: *actor_id,
-                                        class_name: class_name.clone(),
-                                        worker_id: None,
-                                        status: ActorStatus::Creating,
-                                        creation_payload: task.payload.clone(),
+        let mut queued_count = 0;
+        {
+            let mut state = self.gcs.write();
+
+            for msg in messages {
+                match msg {
+                    Message::SubmitJob { job_id, tasks, .. } => {
+                        let mut task_ids = Vec::new();
+                        for task_bytes in tasks {
+                            if let Ok(task) = bincode::deserialize::<Task>(&task_bytes) {
+                                task_ids.push(task.id);
+                                if let TaskKind::ActorCreation { actor_id, class_name } = &task.kind {
+                                    state.actors.insert(
+                                        *actor_id,
+                                        ActorRecord {
+                                            actor_id: *actor_id,
+                                            class_name: class_name.clone(),
+                                            worker_id: None,
+                                            status: ActorStatus::Creating,
+                                            creation_payload: task.payload.clone(),
+                                        },
+                                    );
+                                }
+                                state.active_tasks.insert(
+                                    task.id,
+                                    TaskRecord {
+                                        task: task.clone(),
+                                        status: TaskStatus::Pending,
+                                        assigned_to: None,
+                                        retry_count: 0,
+                                        output_object_id: None,
                                     },
                                 );
                             }
-                            state.active_tasks.insert(
-                                task.id,
-                                TaskRecord {
-                                    task: task.clone(),
-                                    status: TaskStatus::Pending,
-                                    assigned_to: None,
-                                    retry_count: 0,
-                                    output_object_id: None,
+                        }
+                        state.jobs.insert(
+                            job_id,
+                            JobRecord {
+                                job: Job {
+                                    id: job_id,
+                                    name: "Job".to_string(),
                                 },
-                            );
-                        }
-                    }
-                    state.jobs.insert(
-                        job_id,
-                        JobRecord {
-                            job: Job {
-                                id: job_id,
-                                name: "Job".to_string(),
+                                status: JobStatus::Running,
+                                tasks: task_ids,
+                                results: HashMap::new(),
                             },
-                            status: JobStatus::Running,
-                            tasks: task_ids,
-                            results: HashMap::new(),
-                        },
-                    );
-                }
-                Message::TaskSuccess { task_id, job_id, output, object_id, .. } => {
-                    let actor_update = if let Some(record) = state.active_tasks.get_mut(&task_id) {
-                        record.status = TaskStatus::Completed;
-                        match &record.task.kind {
-                            TaskKind::ActorCreation { actor_id, .. } => {
-                                Some((*actor_id, true, record.assigned_to))
+                        );
+                    }
+                    Message::TaskSuccess { task_id, job_id, output, object_id, .. } => {
+                        let actor_update = if let Some(record) = state.active_tasks.get_mut(&task_id) {
+                            record.status = TaskStatus::Completed;
+                            match &record.task.kind {
+                                TaskKind::ActorCreation { actor_id, .. } => {
+                                    Some((*actor_id, true, record.assigned_to))
+                                }
+                                TaskKind::ActorDestruction { actor_id } => {
+                                    Some((*actor_id, false, None))
+                                }
+                                _ => None,
                             }
-                            TaskKind::ActorDestruction { actor_id } => {
-                                Some((*actor_id, false, None))
-                            }
-                            _ => None,
-                        }
-                    } else {
-                        None
-                    };
+                        } else {
+                            None
+                        };
 
-                    if let Some((actor_id, is_alive, assigned_to)) = actor_update {
-                        if let Some(actor_rec) = state.actors.get_mut(&actor_id) {
-                            if is_alive {
-                                actor_rec.status = ActorStatus::Alive;
-                                actor_rec.worker_id = assigned_to;
-                            } else {
-                                actor_rec.status = ActorStatus::Dead("Explicitly destroyed".to_string());
+                        if let Some((actor_id, is_alive, assigned_to)) = actor_update {
+                            if let Some(actor_rec) = state.actors.get_mut(&actor_id) {
+                                if is_alive {
+                                    actor_rec.status = ActorStatus::Alive;
+                                    actor_rec.worker_id = assigned_to;
+                                } else {
+                                    actor_rec.status = ActorStatus::Dead("Explicitly destroyed".to_string());
+                                }
+                            }
+                        }
+
+                        if let Some(oid) = object_id {
+                            state.object_catalog.entry(oid).or_insert_with(|| ObjectLocation {
+                                object_id: oid,
+                                size_bytes: 0,
+                                nodes: HashSet::new(),
+                            });
+                        }
+
+                        if let Some(job_record) = state.jobs.get_mut(&job_id) {
+                            job_record.results.insert(task_id, output);
+                            if job_record.results.len() == job_record.tasks.len() {
+                                job_record.status = JobStatus::Completed;
                             }
                         }
                     }
-
-                    if let Some(oid) = object_id {
-                        state.object_catalog.entry(oid).or_insert_with(|| ObjectLocation {
-                            object_id: oid,
-                            size_bytes: 0,
+                    Message::TaskFailure { task_id, job_id, error } => {
+                        if let Some(record) = state.active_tasks.get_mut(&task_id) {
+                            record.status = TaskStatus::Failed(error.clone());
+                        }
+                        if let Some(job_record) = state.jobs.get_mut(&job_id) {
+                            job_record.status = JobStatus::Failed(error.clone());
+                        }
+                    }
+                    Message::PutObject { object_id, data } => {
+                        state.object_catalog.entry(object_id).or_insert_with(|| ObjectLocation {
+                            object_id,
+                            size_bytes: data.len() as u64,
                             nodes: HashSet::new(),
                         });
+                        objects_to_restore.push((object_id, data));
                     }
-
-                    if let Some(job_record) = state.jobs.get_mut(&job_id) {
-                        job_record.results.insert(task_id, output);
-                        if job_record.results.len() == job_record.tasks.len() {
-                            job_record.status = JobStatus::Completed;
-                        }
+                    Message::DeleteObject { object_id } => {
+                        state.object_catalog.remove(&object_id);
+                        objects_to_delete.push(object_id);
                     }
+                    _ => {}
                 }
-                Message::TaskFailure { task_id, job_id, error } => {
-                    if let Some(record) = state.active_tasks.get_mut(&task_id) {
-                        record.status = TaskStatus::Failed(error.clone());
-                    }
-                    if let Some(job_record) = state.jobs.get_mut(&job_id) {
-                        job_record.status = JobStatus::Failed(error.clone());
-                    }
-                }
-                _ => {}
             }
-        }
 
-        let mut queued_count = 0;
-        for record in state.active_tasks.values() {
-            if record.status == TaskStatus::Pending {
-                let should_enqueue = if record.task.job_id.is_nil() {
-                    true
-                } else if let Some(job) = state.jobs.get(&record.task.job_id) {
-                    job.status == JobStatus::Running
-                } else {
-                    false
-                };
+            for record in state.active_tasks.values() {
+                if record.status == TaskStatus::Pending {
+                    let should_enqueue = if record.task.job_id.is_nil() {
+                        true
+                    } else if let Some(job) = state.jobs.get(&record.task.job_id) {
+                        job.status == JobStatus::Running
+                    } else {
+                        false
+                    };
 
-                if should_enqueue {
-                    self.dispatcher.enqueue(record.task.clone());
-                    queued_count += 1;
+                    if should_enqueue {
+                        self.dispatcher.enqueue(record.task.clone());
+                        queued_count += 1;
+                    }
                 }
             }
         }
 
-        println!("[Disaster Recovery] WAL Recovery complete. Re-queued {} pending tasks.", queued_count);
+        let restored_count = objects_to_restore.len();
+        for (oid, data) in objects_to_restore {
+            let _ = self.object_store.put(oid, bytes::Bytes::from(data)).await;
+        }
+        for oid in objects_to_delete {
+            let _ = self.object_store.delete(oid).await;
+        }
+
+        println!("[Disaster Recovery] WAL Recovery complete. Re-queued {} pending tasks, restored {} objects.", queued_count, restored_count);
         Ok(())
     }
 
@@ -1488,6 +1513,7 @@ impl HeadNode {
                 }
                 accept_result = listener.accept() => {
                     let (stream, peer_addr) = accept_result.map_err(|e| FrameworkError::Network(e.to_string()))?;
+                    let _ = stream.set_nodelay(true);
                     let peer_addr_str = peer_addr.to_string();
                     let framed = Framed::new(stream, MessageCodec::new());
 

@@ -389,12 +389,14 @@ impl WorkerNode {
 
     async fn connect_with_retry(&self, backoffs: &[u64]) -> Option<TcpStream> {
         if let Ok(stream) = TcpStream::connect(&self.head_addr).await {
+            let _ = stream.set_nodelay(true);
             return Some(stream);
         }
 
         for &delay in backoffs {
             tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
             if let Ok(stream) = TcpStream::connect(&self.head_addr).await {
+                let _ = stream.set_nodelay(true);
                 return Some(stream);
             }
         }
